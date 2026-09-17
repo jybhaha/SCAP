@@ -1,0 +1,39 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.so
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Logs and experiment outputs
+*.log
+Results/
+results/
+
+# Datasets and pretrained weights (download separately)
+data/cifar10/
+models/Mask2Former/facebook/
+*.safetensors
+*.pth
+*.pt
+*.ckpt
+
+# Photos taken on site / private inputs
+input_photos/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.env/
+
+# OS
+.DS_Store
+Thumbs.db
