@@ -21,7 +21,7 @@ degrades the target model while remaining inconspicuous in the scene.
 ## Repository layout
 
 ```
-SCAR_pub/
+SCAP/
 ├── attack/
 │   └── attacker.py               # MyPatchAttack: end-to-end attack pipeline
 ├── models/
@@ -60,7 +60,7 @@ SCAR_pub/
 ## Installation
 
 ```bash
-git clone https://github.com/jybhaha/SCAR_pub.git
+git clone https://github.com/jybhaha/SCAP.git
 cd SCAR_pub
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
