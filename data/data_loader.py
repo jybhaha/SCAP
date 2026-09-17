@@ -37,7 +37,7 @@ CATEGORY_PRESETS = {
 class DataLoaderManager:
     """数据加载器管理类"""
     
-    def __init__(self, data_root='/home/jyb/0code/Data/ImageNet/train'):
+    def __init__(self, data_root='data/ImageNet/train'):
         self.data_root = data_root
         self.train_root = data_root
         self.val_root = data_root.replace('/train', '/val')  # 添加验证集路径

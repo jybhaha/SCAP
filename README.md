@@ -1,4 +1,4 @@
-# SCAR
+# SCAP
 
 **S**emantic-guided **C**ontextual **A**dversarial patch attack — an open-source PyTorch
 toolbox for generating contextually camouflaged adversarial patches.

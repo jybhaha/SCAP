@@ -22,8 +22,8 @@ class PatchGenerator:
     ]
 
     def __init__(self, 
-                 model_path="/home/jyb/0code/SD-v1-5-model/stable-diffusion-v1-5", 
-                 json_path="/home/jyb/0code/SCAR/数据准备/ADE20K_patches.json",
+                 model_path="models/StableDiffusion/stable-diffusion-v1-5", 
+                 json_path="data/ADE20K_patches.json",
                  device="cuda"):
         self.device = device
         self.idx_to_label = {

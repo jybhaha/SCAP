@@ -715,7 +715,7 @@ def parse_args():
     parser.add_argument(
         "--data-root",
         type=str,
-        default=os.environ.get("IMAGENET_VAL_ROOT", "/home/jyb/0code/Data/ImageNet/val"),
+        default=os.environ.get("IMAGENET_VAL_ROOT", "data/ImageNet/val"),
         help="ImageNet 验证集路径",
     )
     parser.add_argument(

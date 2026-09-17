@@ -48,7 +48,7 @@ attacks:
 
 # 输出设置
 output:
-  base_dir: "/home/jyb/0code/results/baseline"
+  base_dir: "results/baseline"
   save_adv_images: true  # 新增：控制是否保存对抗样本
   save_metrics: true
   generate_plots: true

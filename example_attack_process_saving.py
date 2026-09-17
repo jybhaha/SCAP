@@ -57,7 +57,7 @@ def example_save_attack_process():
     ])
     
     # 定义ImageNet图片路径
-    imagenet_base_path = "/home/jyb/0code/Data/ImageNet/val"
+    imagenet_base_path = "data/ImageNet/val"
     image_paths = [
         os.path.join(imagenet_base_path, "n04461696/ILSVRC2012_val_00029413.JPEG"),
         os.path.join(imagenet_base_path, "n03891332/ILSVRC2012_val_00034802.JPEG"),
@@ -160,7 +160,7 @@ def example_targeted_attack_process():
     ])
     
     # 定义ImageNet图片路径
-    imagenet_base_path = "/home/jyb/0code/Data/ImageNet/val"
+    imagenet_base_path = "data/ImageNet/val"
     image_paths = [
         os.path.join(imagenet_base_path, "n04461696/ILSVRC2012_val_00029413.JPEG"),
         os.path.join(imagenet_base_path, "n03891332/ILSVRC2012_val_00034802.JPEG"),

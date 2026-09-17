@@ -11,12 +11,12 @@ import argparse
 from datetime import datetime
 
 # 添加项目根目录到路径
-sys.path.append('/home/jyb/0code/SCAR')
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def main():
     parser = argparse.ArgumentParser(description='Run Baseline Perceptual Comparison Experiment')
     parser.add_argument('--config', type=str, 
-                       default='/home/jyb/0code/SCAR/experiments/baseline_perceptual_config.yaml',
+                       default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline_perceptual_config.yaml"),
                        help='Configuration file path')
     parser.add_argument('--batch_size', type=int, default=4, help='Batch size for evaluation')
     parser.add_argument('--max_batches', type=int, default=5, help='Maximum number of batches to process')

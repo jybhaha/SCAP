@@ -5,7 +5,7 @@ import os
 import random
 
 def get_dataloader(
-    data_root='/home/jyb/0code/imagenet/train',
+    data_root='data/imagenet/train',
     batch_size=4,
     image_size=224,
     total_samples=None,  # 新增参数：随机选取图像数量

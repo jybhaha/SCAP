@@ -56,7 +56,7 @@ def test_attack_process_saving():
     ])
     
     # 定义ImageNet图片路径
-    imagenet_base_path = "/home/jyb/0code/Data/ImageNet/val"
+    imagenet_base_path = "data/ImageNet/val"
     image_paths = [
         os.path.join(imagenet_base_path, "n04461696/ILSVRC2012_val_00029413.JPEG"),
     ]

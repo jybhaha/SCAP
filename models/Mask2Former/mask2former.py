@@ -66,10 +66,10 @@ class SemanticSegmentor:
         self.device = device
 
         self.processor = Mask2FormerImageProcessor.from_pretrained(
-            "/home/jyb/0code/SCAR/models/Mask2Former/facebook/mask2former-swin-base-ade-semantic",
+            "models/Mask2Former/facebook/mask2former-swin-base-ade-semantic",
             local_files_only=True)
         self.model = Mask2FormerForUniversalSegmentation.from_pretrained(
-            "/home/jyb/0code/SCAR/models/Mask2Former/facebook/mask2former-swin-base-ade-semantic",
+            "models/Mask2Former/facebook/mask2former-swin-base-ade-semantic",
             local_files_only=True).to(device)
         self.model.eval()
 
