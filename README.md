@@ -3,7 +3,7 @@
 **S**emantic-guided **C**ontextual **A**dversarial patch attack — an open-source PyTorch
 toolbox for generating contextually camouflaged adversarial patches.
 
-SCAR couples **where** a patch is placed with **how** it is synthesised: panoptic
+SCAP couples **where** a patch is placed with **how** it is synthesised: panoptic
 semantic masks and Grad-CAM saliency delimit admissible placement regions, a latent
 diffusion prior conditioned on scene semantics and a CIELab colour seed synthesises a
 natural-looking initial patch, and an MI-FGSM-style optimiser refines it under an
@@ -61,7 +61,7 @@ SCAP/
 
 ```bash
 git clone https://github.com/jybhaha/SCAP.git
-cd SCAR_pub
+cd SCAP
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
