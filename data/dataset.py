@@ -1,3 +1,4 @@
+import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.datasets import ImageFolder
 import torchvision.transforms as T
@@ -8,8 +9,10 @@ def get_dataloader(
     data_root='data/imagenet/train',
     batch_size=4,
     image_size=224,
-    total_samples=None,  # 新增参数：随机选取图像数量
-    seed=42              # 可复现性
+    total_samples=None,
+    seed=42,
+    shuffle=False,
+    num_workers=4,
 ):
     transform = T.Compose([
         T.Resize((image_size, image_size)),
@@ -17,16 +20,24 @@ def get_dataloader(
     ])
 
     dataset = ImageFolder(root=data_root, transform=transform)
+    class_names = list(dataset.classes)
+    indices = list(range(len(dataset)))
 
     if total_samples is not None and total_samples < len(dataset):
-        random.seed(seed)
-        indices = random.sample(range(len(dataset)), total_samples)
+        # data_seed is independent from attack seeds: every seed sees identical
+        # images in the same order, as required by the controlled protocol.
+        indices = random.Random(seed).sample(indices, total_samples)
         dataset = Subset(dataset, indices)
 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    generator = torch.Generator().manual_seed(seed)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
+                            num_workers=num_workers, generator=generator)
+    dataloader.class_names = class_names
+    dataloader.selected_indices = indices
     return dataloader
 
 
+import torch
 from torch.utils.data import Dataset, DataLoader, Subset
 from torchvision.datasets import ImageFolder
 import torchvision.transforms as T

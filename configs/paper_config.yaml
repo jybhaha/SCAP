@@ -1,0 +1,56 @@
+# Reference implementation settings for the SoftwareX method description.
+# No experiment result is encoded in this file.
+patch_size: [64, 64]
+blend_width: 5
+patch_k: 1
+placement_strategy: scene_aware
+cam_model_name: resnet50
+cam_percentile: 30
+topk_cam_regions: 1
+eval_topk: 1
+targeted_attack: true
+target_class: 207
+target_strategy: fixed
+cam_thresh_ratio: 0.3
+mask_thresh_ratio: 0.2
+selection_relaxation_steps: 4
+selection_fallback_policy: raise
+steps: 100
+eps: 0.06274509803921569  # 16/255
+alpha: 0.03137254901960784  # 8/255
+advpatch_step_size: 0.01
+lavan_step_size: 0.01
+decay: 1.0
+lambda_adv: 1.0
+lambda_smooth: 0.1
+lambda_color: 0.05
+use_momentum: true
+seed: 42
+seeds: [42, 43, 44]
+data_seed: 42
+n_boot: 10000
+reference_num_samples: 1000
+extended_num_samples: 5000
+n_colors: 3
+use_color_info: true
+scene_aware_placement: true
+diffusion_init: true
+diffusion_steps: 20
+diffusion_guidance_scale: 7.5
+mask2former_checkpoint: facebook/mask2former-swin-base-ade-panoptic
+mask2former_local_files_only: true
+stable_diffusion_checkpoint: stable-diffusion-v1-5/stable-diffusion-v1-5
+stable_diffusion_local_files_only: true
+disable_safety_checker: false
+shared_stage2_coords: true
+classifier_weights: IMAGENET1K_V1
+models:
+  - resnet50
+  - vgg16
+  - densenet121
+  - inception_v3
+  - efficientnet_b0
+  - mobilenet_v3_large
+  - convnext_tiny
+  - vit_b_16
+  - swin_t

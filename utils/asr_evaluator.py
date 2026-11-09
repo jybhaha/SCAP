@@ -1,10 +1,11 @@
 import torch
+from models.imagenet_model import ensure_imagenet_normalized
 from utils.result_saver import ResultManager
 
 
 class ASREvaluator:
     def __init__(self, model, device='cuda'):
-        self.model = model.eval().to(device)
+        self.model = ensure_imagenet_normalized(model).eval().to(device)
         
         self.device = device
         self.rm = ResultManager.get_instance()

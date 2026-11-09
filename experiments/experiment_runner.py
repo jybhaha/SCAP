@@ -12,6 +12,7 @@ from utils.perceptual_evaluator import PerceptualEvaluator
 from utils.result_saver import ResultManager
 from models.base_line import PixelAttackBaseline, PatchAttackBaseline
 from models.my_patch_attack import MyPatchAttack, MyPatchAttack_Eva
+from models.imagenet_model import ensure_imagenet_normalized
 from configs.experiment_configs import get_config, get_ablation_params, get_target_class
 
 
@@ -26,9 +27,9 @@ class BaseExperimentRunner:
         
     def _init_models(self):
         """初始化基础模型"""
-        self.classifier_model = models.resnet50(
+        self.classifier_model = ensure_imagenet_normalized(models.resnet50(
             weights=models.ResNet50_Weights.IMAGENET1K_V1
-        ).eval().to(self.device)
+        )).eval().to(self.device)
         
     def _init_evaluators(self):
         """初始化评估器"""
@@ -860,9 +861,8 @@ class RobustnessExperimentRunner(BaseExperimentRunner):
         
         # 1. 对抗训练模型
         try:
-            self.defense_models["adversarial_training"] = models.resnet50(
-                weights=models.ResNet50_Weights.IMAGENET1K_V1
-            ).eval().to(self.device)
+            from experiments.experiment_04_robustness_2 import load_robust_model
+            self.defense_models["adversarial_training"] = load_robust_model(self.device)
             self.rm.log("对抗训练模型加载成功")
         except Exception as e:
             self.rm.log(f"对抗训练模型加载失败: {e}")
@@ -908,6 +908,8 @@ class RobustnessExperimentRunner(BaseExperimentRunner):
             self.target_models["efficientnet_b0"] = models.efficientnet_b0(
                 weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1
             ).eval().to(self.device)
+            for model_name, target_model in list(self.target_models.items()):
+                self.target_models[model_name] = ensure_imagenet_normalized(target_model).eval().to(self.device)
             
             self.rm.log("目标模型加载成功")
         except Exception as e:

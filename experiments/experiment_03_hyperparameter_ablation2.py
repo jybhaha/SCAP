@@ -134,8 +134,9 @@ class SCAPComponentVariantAttack(MyPatchAttack_Eva):
         if not self.component_flags["boundary_aware_fusion"]:
             custom_config["blend_width"] = 0
         if not self.component_flags["attention_avoidance"]:
-            # 强制放宽 CAM 约束，避免被动启用
-            custom_config["cam_thresh_ratio"] = 0.0
+            custom_config["cam_thresh_ratio"] = 1.0
+        if not self.component_flags["color_matching"]:
+            custom_config["lambda_color"] = 0.0
         self._rng = random.Random(base_config.get("seed", 3407))
         super().__init__(
             model=model,

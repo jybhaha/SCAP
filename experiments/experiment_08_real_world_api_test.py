@@ -19,7 +19,6 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from utils.result_saver import ResultManager
-from experiments.experiment_runner import ExperimentRunner
 from data.data_loader import get_objects_experiment_dataloader
 from configs.experiment_configs import get_config
 
@@ -27,28 +26,52 @@ from configs.experiment_configs import get_config
 class RealWorldAPITester:
     """真实世界API测试器"""
     
-    def __init__(self, device='cuda'):
+    def __init__(self, device='cuda', dry_run=True, requests_per_minute=30):
         self.device = torch.device(device)
-        self.rm = ResultManager.get_instance()
+        self.dry_run = bool(dry_run)
+        self.min_request_interval = 60.0 / float(requests_per_minute)
+        if self.min_request_interval <= 0:
+            raise ValueError("requests_per_minute must be positive")
+        self._last_request_time = None
+        if not self.dry_run and os.environ.get("SCAP_AUTHORIZED_API_TEST") != "1":
+            raise PermissionError(
+                "Live commercial API tests require SCAP_AUTHORIZED_API_TEST=1 and documented authorisation"
+            )
+        self.rm = None if self.dry_run else ResultManager.get_instance()
         self._init_api_configs()
-        
+
     def _init_api_configs(self):
-        """初始化API配置"""
+        """Build endpoint configuration from environment variables, never hard-coded keys."""
+        endpoints = {}
+        for name, default in {
+            "taobao": "https://eco.taobao.com/router/rest",
+            "jd": "https://api.jd.com/routerjson",
+            "pinduoduo": "https://open-api.pinduoduo.com/api",
+            "tmall": "https://eco.taobao.com/router/rest",
+        }.items():
+            endpoints[name] = os.environ.get(f"SCAP_API_ENDPOINT_{name.upper()}", default)
         self.api_configs = {
             "ecommerce": {
                 "name": "E-commerce Image Recognition",
-                "endpoints": {
-                    "taobao": "https://eco.taobao.com/router/rest",
-                    "jd": "https://api.jd.com/routerjson",
-                    "pinduoduo": "https://open-api.pinduoduo.com/api",
-                    "tmall": "https://eco.taobao.com/router/rest"
-                },
-                "headers": {
-                    "Content-Type": "application/json",
-                    "Authorization": "Bearer YOUR_API_KEY"
-                },
-                "timeout": 30
+                "endpoints": endpoints,
+                "headers": {"Content-Type": "application/json"},
+                "timeout": 30,
             }
+        }
+
+    def dry_run_plan(self, categories):
+        """Return the intended calls without loading data or performing network I/O."""
+        return {
+            "dry_run": True,
+            "network_calls": 0,
+            "categories": categories,
+            "platforms": list(self.api_configs["ecommerce"]["endpoints"]),
+            "requirements_for_live_test": [
+                "Documented authorisation from the API provider",
+                "SCAP_AUTHORIZED_API_TEST=1",
+                "SCAP_API_KEY or platform-specific SCAP_API_KEY_<PLATFORM>",
+                "Optional SCAP_API_ENDPOINT_<PLATFORM> overrides",
+            ],
         }
     
     def _image_to_base64(self, image_tensor):
@@ -80,60 +103,40 @@ class RealWorldAPITester:
             return None, None
     
     def _call_api(self, api_type, endpoint_name, image_base64, original_label=None):
-        """调用API进行图像识别"""
-        try:
-            config = self.api_configs[api_type]
-            endpoint = config["endpoints"][endpoint_name]
-            
-            # 构建请求数据
-            payload = {
-                "image": image_base64,
-                "format": "base64"
-            }
-            
-            if original_label is not None:
-                payload["expected_label"] = original_label
-            
-            # 发送请求
-            response = requests.post(
-                endpoint,
-                headers=config["headers"],
-                json=payload,
-                timeout=config["timeout"]
+        """Call an authorised endpoint with env credentials and client-side rate limiting."""
+        if self.dry_run:
+            return {"success": False, "dry_run": True, "error": "dry-run: no network request sent",
+                    "response_time": 0.0}
+        if os.environ.get("SCAP_AUTHORIZED_API_TEST") != "1":
+            raise PermissionError("Live API call blocked: SCAP_AUTHORIZED_API_TEST=1 is required")
+        config = self.api_configs[api_type]
+        endpoint = config["endpoints"][endpoint_name]
+        key = os.environ.get(f"SCAP_API_KEY_{endpoint_name.upper()}") or os.environ.get("SCAP_API_KEY")
+        if not key:
+            raise PermissionError(
+                f"Missing credential: set SCAP_API_KEY_{endpoint_name.upper()} or SCAP_API_KEY"
             )
-            
+        now = time.monotonic()
+        if self._last_request_time is not None:
+            remaining = self.min_request_interval - (now - self._last_request_time)
+            if remaining > 0:
+                time.sleep(remaining)
+        payload = {"image": image_base64, "format": "base64"}
+        if original_label is not None:
+            payload["expected_label"] = original_label
+        headers = dict(config["headers"])
+        headers["Authorization"] = f"Bearer {key}"
+        try:
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=config["timeout"])
+            self._last_request_time = time.monotonic()
             if response.status_code == 200:
-                result = response.json()
-                return {
-                    "success": True,
-                    "result": result,
-                    "response_time": response.elapsed.total_seconds()
-                }
-            else:
-                return {
-                    "success": False,
-                    "error": f"HTTP {response.status_code}: {response.text}",
-                    "response_time": response.elapsed.total_seconds()
-                }
-                
-        except requests.exceptions.Timeout:
-            return {
-                "success": False,
-                "error": "Request timeout",
-                "response_time": config["timeout"]
-            }
-        except requests.exceptions.RequestException as e:
-            return {
-                "success": False,
-                "error": f"Request failed: {str(e)}",
-                "response_time": 0
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Unknown error: {str(e)}",
-                "response_time": 0
-            }
+                return {"success": True, "result": response.json(),
+                        "response_time": response.elapsed.total_seconds()}
+            return {"success": False, "error": f"HTTP {response.status_code}: {response.text}",
+                    "response_time": response.elapsed.total_seconds()}
+        except requests.exceptions.RequestException as exc:
+            self._last_request_time = time.monotonic()
+            return {"success": False, "error": f"Request failed: {exc}", "response_time": 0.0}
     
     def _parse_api_response(self, api_type, response):
         """解析API响应 - 改进版本，支持多种响应格式"""
@@ -321,8 +324,10 @@ class RealWorldAPITester:
             return image_pil
     
     def test_ecommerce_apis(self, dataloader, class_names, config):
-        """测试电商平台图像识别API"""
-        self.rm.log("Starting e-commerce API testing with real API calls...")
+        """测试电商平台图像识别API；dry-run不产生目录、请求或结果数值。"""
+        if self.dry_run:
+            return self.dry_run_plan(categories=class_names)
+        self.rm.log("Starting authorised e-commerce API testing...")
         
         # 创建结果保存目录
         result_dir = "Results/experiment_08_api_test"
@@ -555,13 +560,11 @@ Platform & ASR & Successful Attacks & Total Samples & Avg Response Time (s) & Er
         return latex
 
 
-def run_real_world_api_test_experiment(dataloader_mode="small", categories="household"):
-    """
-    运行真实世界API测试实验
-    Args:
-        dataloader_mode: 数据加载器模式
-        categories: 物体类别，可选 "household", "tools", "vehicles", "sports" 或组合
-    """
+def run_real_world_api_test_experiment(dataloader_mode="small", categories="household", dry_run=True):
+    """Run the API protocol; the default returns a plan without data or network access."""
+    api_tester = RealWorldAPITester(dry_run=dry_run)
+    if dry_run:
+        return api_tester.dry_run_plan(categories)
     rm = ResultManager.get_instance()
     rm.set_experiment("RealWorldAPITest")
     rm.set_test("api_test_real_apis")
@@ -600,8 +603,7 @@ def run_real_world_api_test_experiment(dataloader_mode="small", categories="hous
     # 获取配置
     config = get_config("default")
     
-    # 初始化API测试器
-    api_tester = RealWorldAPITester()
+    # 已在此函数入口完成授权检查与测试器初始化
     
     # 测试电商平台图像识别API
     rm.log("=== Starting E-commerce API Testing with Real API Calls ===")

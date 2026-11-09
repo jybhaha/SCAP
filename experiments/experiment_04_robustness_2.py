@@ -59,6 +59,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from configs.experiment_configs import get_config, get_target_class
 from data.dataset import get_dataloader
 from models.base_line import PatchAttackBaseline, PixelAttackBaseline
+from models.imagenet_model import ensure_imagenet_normalized
 from models.my_patch_attack import MyPatchAttack_Eva
 from utils.result_saver import ResultManager
 
@@ -194,24 +195,20 @@ class PatchDetector(nn.Module):
 
 
 def load_robust_model(device: torch.device):
-    """加载鲁棒的ResNet-50模型（对抗训练）"""
+    """Load the declared adversarially trained model; never substitute a standard one."""
     try:
-        # 尝试从 robustbench 加载
         from robustbench.utils import load_model
-
         model = load_model(
-            model_name="Standard",
+            model_name="Salman2020Do_R50",
             dataset="imagenet",
             threat_model="Linf",
         )
-        model = model.eval().to(device)
-        print("成功加载 robustbench 鲁棒模型")
-        return model
-    except Exception as e:
-        # 如果 robustbench 不可用，使用标准模型作为fallback
-        print(f"无法加载robustbench模型: {e}，使用标准ResNet-50")
-        model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).eval().to(device)
-        return model
+        return model.eval().to(device)
+    except Exception as exc:
+        raise RuntimeError(
+            "Adversarial-training evaluation requires RobustBench Salman2020Do_R50; "
+            "a standard ResNet-50 is not a valid substitute"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +224,9 @@ class RobustnessExperimentRunner:
         self.rm = ResultManager.get_instance()
         
         # 初始化分类模型
-        self.classifier = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1).eval().to(self.device)
+        self.classifier = ensure_imagenet_normalized(
+            models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+        ).eval().to(self.device)
         
         # 初始化攻击器
         self._init_attackers()
@@ -262,7 +261,7 @@ class RobustnessExperimentRunner:
             self.scap_attack = MyPatchAttack_Eva(
                 model=self.classifier,
                 device=str(self.device),
-                config=get_config("optimized"),
+                config=get_config("paper"),
                 debug=False,
                 save_imgs=False,
                 save_attack_process=False,

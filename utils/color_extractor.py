@@ -1,60 +1,85 @@
+"""Deterministic dominant-colour extraction in CIELab space."""
+
+from __future__ import annotations
+
 from typing import List
+
 import numpy as np
 from matplotlib import colors
 from PIL import Image
 from sklearn.cluster import KMeans
 
+from utils.color_space import lab_to_rgb_numpy, rgb_to_lab_numpy
+
+
 class ColorExtractor:
-    def __init__(self, n_colors=3):
-        self.n_colors = n_colors
+    def __init__(self, n_colors=3, random_state=42):
+        if n_colors < 1:
+            raise ValueError("n_colors must be positive")
+        self.n_colors = int(n_colors)
+        self.random_state = int(random_state)
         self.xkcd_colors = {
-            name.replace("xkcd:", ""): tuple(int(c * 255) for c in colors.to_rgb(val))
-            for name, val in colors.XKCD_COLORS.items()
+            name.replace("xkcd:", ""): tuple(int(channel * 255) for channel in colors.to_rgb(value))
+            for name, value in colors.XKCD_COLORS.items()
+        }
+        names = list(self.xkcd_colors)
+        rgb = np.asarray([self.xkcd_colors[name] for name in names], dtype=np.float32) / 255.0
+        self._xkcd_names = names
+        self._xkcd_lab = rgb_to_lab_numpy(rgb)
+
+    def get_dominant_palette(self, pil_img, pixel_mask=None):
+        """Return RGB/Lab centres and names for the selected pixels.
+
+        ``pixel_mask`` is a boolean H×W mask. Stage 2 supplies its selected
+        window here; omitting it retains the standalone whole-image interface.
+        """
+        image = pil_img.convert("RGB")
+        if pixel_mask is None:
+            image = image.resize((50, 50))
+            rgb_pixels = np.asarray(image, dtype=np.float32).reshape(-1, 3) / 255.0
+        else:
+            mask = np.asarray(pixel_mask, dtype=bool)
+            pixels = np.asarray(image, dtype=np.float32)
+            if mask.shape != pixels.shape[:2]:
+                raise ValueError(f"pixel_mask shape {mask.shape} does not match image {pixels.shape[:2]}")
+            rgb_pixels = pixels[mask].reshape(-1, 3) / 255.0
+            if len(rgb_pixels) == 0:
+                raise ValueError("Cannot extract a palette from an empty selected region")
+        lab_pixels = rgb_to_lab_numpy(rgb_pixels)
+        cluster_count = min(self.n_colors, len(lab_pixels))
+        kmeans = KMeans(n_clusters=cluster_count, n_init=10, random_state=self.random_state)
+        labels = kmeans.fit_predict(lab_pixels)
+        counts = np.bincount(labels, minlength=cluster_count)
+        order = np.argsort(-counts, kind="stable")
+        # Rounding suppresses insignificant BLAS reduction-order jitter while
+        # retaining much more precision than an RGB uint8 palette.
+        lab_palette = np.round(kmeans.cluster_centers_[order].astype(np.float32), decimals=3)
+        rgb_palette = lab_to_rgb_numpy(lab_palette)
+        rgb_u8 = np.rint(rgb_palette * 255.0).astype(np.uint8)
+        names = [self.lab_to_xkcd_name(lab) for lab in lab_palette]
+        return {
+            "rgb": [tuple(int(channel) for channel in colour) for colour in rgb_u8],
+            "lab": [tuple(float(channel) for channel in colour) for colour in lab_palette],
+            "names": names,
         }
 
     def get_dominant_colors(self, pil_img):
-        img = pil_img.convert("RGB").resize((50, 50))  # 降低计算量
-        pixels = np.array(img).reshape(-1, 3)
-
-        # 使用 KMeans 聚类
-        kmeans = KMeans(n_clusters=self.n_colors, n_init=10)
-        labels = kmeans.fit_predict(pixels)
-        centers = kmeans.cluster_centers_.astype(int)
-
-        # 按聚类中心出现频率排序
-        counts = np.bincount(labels)
-        sorted_idxs = np.argsort(-counts)
-
-        return [tuple(centers[i]) for i in sorted_idxs]
+        """Legacy RGB-only interface."""
+        return self.get_dominant_palette(pil_img)["rgb"]
 
     def rgb_to_xkcd_name(self, rgb):
-        def dist(c1, c2):
-            return sum((a - b) ** 2 for a, b in zip(c1, c2))
-        min_dist = float("inf")
-        closest_name = None
-        for name, xkcd_rgb in self.xkcd_colors.items():
-            d = dist(rgb, xkcd_rgb)
-            if d < min_dist:
-                min_dist = d
-                closest_name = name
-        return closest_name
+        rgb_array = np.asarray(rgb, dtype=np.float32).reshape(1, 3)
+        if rgb_array.max() > 1.0:
+            rgb_array = rgb_array / 255.0
+        return self.lab_to_xkcd_name(rgb_to_lab_numpy(rgb_array)[0])
+
+    def lab_to_xkcd_name(self, lab):
+        distances = np.sum((self._xkcd_lab - np.asarray(lab, dtype=np.float32)) ** 2, axis=1)
+        return self._xkcd_names[int(np.argmin(distances))]
 
     def get_top_color_names(self, pil_img, topk=3):
-        dominant_rgbs = self.get_dominant_colors(pil_img)
-        return [self.rgb_to_xkcd_name(rgb) for rgb in dominant_rgbs[:topk]]
+        return self.get_dominant_palette(pil_img)["names"][:topk]
 
-    # 新增批量接口
     def get_top_color_names_batch(self, pil_imgs: List[Image.Image], topk=3):
-        """
-        支持批量输入PIL图像，返回对应的颜色名称列表。
-        返回形如：[['red', 'blue', 'green'], ['black', 'white', 'gray'], ...]
-        """
-        results = []
-        for pil_img in pil_imgs:
-            try:
-                names = self.get_top_color_names(pil_img, topk=topk)
-            except Exception as e:
-                names = []
-                print(f"ColorExtractor batch error: {e}")
-            results.append(names)
-        return results
+        """Batch interface; extraction errors deliberately propagate to the caller."""
+        return [self.get_top_color_names(image, topk=topk) for image in pil_imgs]

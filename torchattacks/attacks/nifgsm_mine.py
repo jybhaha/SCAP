@@ -81,7 +81,7 @@ class NIFGSM_MINE(Attack):
 
             # 更新对抗样本，直接使用调整后的梯度
             adv_images = adv_images.detach() + self.alpha * adjusted_grad
-            
+
             #adv_images = adv_images.detach() + self.alpha * grad.sign()
             delta = torch.clamp(adv_images - images, min=-self.eps, max=self.eps)
             adv_images = torch.clamp(images + delta, min=0, max=1).detach()

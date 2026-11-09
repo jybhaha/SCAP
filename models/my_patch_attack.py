@@ -1,725 +1,414 @@
-import torch
-import numpy as np
-from torchvision.transforms.functional import to_pil_image
-import torchvision.transforms as transforms
+"""Unified end-to-end SCAP attack pipeline.
+
+``MyPatchAttack`` returns an adversarial tensor. ``MyPatchAttack_Eva`` additionally
+returns per-step predictions. ``attack.attacker`` re-exports these classes.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import os
+import random
 from datetime import datetime
 
-from utils.patch_selector import PatchSelectorBatch
+import numpy as np
+import torch
+import torchvision.transforms.functional as TF
+import torchvision.utils as vutils
+from PIL import Image
+
+from configs.experiment_configs import DEFAULT_CONFIG
+from models.Mask2Former.mask2former import SemanticSegmentor
+from models.imagenet_model import ensure_imagenet_normalized
+from models.patch_optimizer import PatchOptimizer
+from models.StableFusion.patch_generator import PatchGenerator
 from utils.cam_generator import CAMGenerator
 from utils.color_extractor import ColorExtractor
-from models.StableFusion.patch_generator import PatchGenerator
+from utils.color_space import rgb_to_lab_numpy
 from utils.patch_blender import PatchBlender
-from models.patch_optimizer import PatchOptimizer
-from models.Mask2Former.mask2former import SemanticSegmentor
+from utils.patch_selector import PatchSelectorBatch, UnresolvedPlacementError
+from utils.profiling import StageProfiler, save_diagnostics
 from utils.result_saver import ResultManager
-
-DEFAULT_CONFIG = {
-    "patch_size": (24, 24),
-    "blend_width": 5,
-    "patch_k": 3,
-    "cam_model_name": "resnet50",
-    "cam_percentile": 30,
-    "topk_cam_regions": 1,
-    "eval_topk": 1,
-    "targeted_attack": False,
-    "cam_thresh_ratio": 0.3,
-    "mask_thresh_ratio": 0.2,
-    "steps": 25,
-    "eps": 16/255,
-    "alpha": 8/255
-}
-
-class MyPatchAttack_Eva:
-    """评估版本的MyPatchAttack，返回对抗样本和每步预测结果"""
-    
-    def __init__(self, model, device='cuda', config=None, debug=False, save_imgs=False, save_attack_process=False):
-        self.device = torch.device(device)
-        self.model = model.to(self.device).eval()
-        self.debug = debug
-        self.save_imgs = save_imgs
-        self.save_attack_process = save_attack_process  # 新增：是否保存攻击过程
-
-        self.config = {**DEFAULT_CONFIG, **(config or {})}
-        self._init_modules()
-        self._init_logger()
-        self._init_timestamp()
-        self.target = self.config["targeted_attack"]
-        if self.target:
-            self.rm.log("[Targeted Attack] 启动目标攻击模式")
-        else:
-            self.rm.log("[Non-targeted Attack] 启动非目标攻击模式")
-        
-    def _init_modules(self):
-        self.segmentor = SemanticSegmentor()
-        self.patch_gen = PatchGenerator(device=self.device)
-        self.color_extractor = ColorExtractor()
-        self.patch_blender = PatchBlender(blend_width=self.config["blend_width"])
-        self.optimizer = PatchOptimizer(device=self.device,steps=self.config["steps"],eps=self.config["eps"], alpha=self.config["alpha"])
-        self.cam_gen = CAMGenerator(model_name=self.config["cam_model_name"], device=str(self.device))
-
-    def _init_logger(self):
-        self.rm = ResultManager.get_instance() 
-        if self.rm:
-            if self.debug:
-                self.rm.log("[Debug Mode] 启动MyPatchAttack调试模式")
-
-    def _init_timestamp(self):
-        self._timestamp = datetime.now().strftime("%Y%m%dT%H%M%S") if self.save_imgs else None
-
-    def _log(self, msg):
-        if self.debug and self.rm:
-            self.rm.log(f"[Debug] {msg}")
-
-    def _save_img(self, vis_func, *args, **kwargs):
-        if self.save_imgs:
-            vis_func(*args, save_dir=self.rm.img_dir, timestamp_str=self._timestamp, show=False, **kwargs)
-
-    def _save_attack_process(self, step_name, images_dict, sample_idx=0):
-        """保存攻击过程的各个步骤图片
-        
-        Args:
-            step_name: 步骤名称，如 'original', 'segmentation', 'cam', 'patches', 'blended', 'adversarial'
-            images_dict: 包含图片的字典，键为图片名称，值为图片tensor或PIL图像
-            sample_idx: 样本索引
-        """
-        if not self.save_attack_process:
-            return
-            
-        import os
-        from PIL import Image
-        import torchvision.utils as vutils
-        
-        # 创建攻击过程保存目录
-        process_dir = os.path.join(self.rm.img_dir, "attack_process")
-        os.makedirs(process_dir, exist_ok=True)
-        
-        # 为每个样本创建子目录
-        sample_dir = os.path.join(process_dir, f"sample_{sample_idx}")
-        os.makedirs(sample_dir, exist_ok=True)
-        
-        # 保存每个步骤的图片
-        for img_name, img in images_dict.items():
-            if img is None:
-                continue
-                
-            # 确保图片是tensor格式
-            if isinstance(img, Image.Image):
-                img = transforms.ToTensor()(img)
-            elif isinstance(img, np.ndarray):
-                img = torch.from_numpy(img).float()
-                
-            # 确保是3D tensor [C, H, W]
-            if img.dim() == 4:
-                img = img[0]  # 取第一个样本
-            elif img.dim() == 2:
-                img = img.unsqueeze(0).repeat(3, 1, 1)  # 灰度图转RGB
-                
-            # 确保值在[0,1]范围内
-            if img.max() > 1.0:
-                img = img / 255.0
-                
-            # 保存图片
-            filename = f"{step_name}_{img_name}.png"
-            filepath = os.path.join(sample_dir, filename)
-            vutils.save_image(img, filepath)
-            
-        if self.debug:
-            self._log(f"保存攻击过程图片: {step_name} -> {sample_dir}")
-
-
-        """保存攻击过程的各个步骤图片
-        
-        Args:
-            step_name: 步骤名称，如 'original', 'segmentation', 'cam', 'patches', 'blended', 'adversarial'
-            images_dict: 包含图片的字典，键为图片名称，值为图片tensor或PIL图像
-            sample_idx: 样本索引
-        """
-        if not self.save_attack_process:
-            return
-            
-        import os
-        from PIL import Image
-        import torchvision.utils as vutils
-        
-        # 创建攻击过程保存目录
-        process_dir = os.path.join(self.rm.img_dir, "attack_process")
-        os.makedirs(process_dir, exist_ok=True)
-        
-        # 为每个样本创建子目录
-        sample_dir = os.path.join(process_dir, f"sample_{sample_idx}")
-        os.makedirs(sample_dir, exist_ok=True)
-        
-        # 保存每个步骤的图片
-        for img_name, img in images_dict.items():
-            if img is None:
-                continue
-                
-            # 确保图片是tensor格式
-            if isinstance(img, Image.Image):
-                img = transforms.ToTensor()(img)
-            elif isinstance(img, np.ndarray):
-                img = torch.from_numpy(img).float()
-                
-            # 确保是3D tensor [C, H, W]
-            if img.dim() == 4:
-                img = img[0]  # 取第一个样本
-            elif img.dim() == 2:
-                img = img.unsqueeze(0).repeat(3, 1, 1)  # 灰度图转RGB
-                
-            # 确保值在[0,1]范围内
-            if img.max() > 1.0:
-                img = img / 255.0
-                
-            # 保存图片
-            filename = f"{step_name}_{img_name}.png"
-            filepath = os.path.join(sample_dir, filename)
-            vutils.save_image(img, filepath)
-            
-        if self.debug:
-            self._log(f"保存攻击过程图片: {step_name} -> {sample_dir}")
-
-    def run(self, x, y, target=None, sample_idx=0):
-        """
-        评估版本，返回 adv 和 step_preds_list（每步预测标签），与 baseline 评估接口一致
-        """
-        attack_id = target if self.target and target is not None else y
-        
-        # 保存原始图片
-        if self.save_attack_process:
-            self._save_attack_process('original', {'input': x[0]}, sample_idx=sample_idx)
-        
-        pil_imgs = self._to_pil(x)
-        color_names = self._extract_colors(pil_imgs)
-        
-        # 语义分割步骤
-        seg_maps, region_names, region_masks = self._segment_semantics(x)
-        if self.save_attack_process:
-            # 保存分割结果
-            seg_images = {}
-            for i, (seg_map, mask) in enumerate(zip(seg_maps, region_masks)):
-                if i == 0:  # 只保存第一个样本
-                    # 保存region_mask（tensor格式）
-                    if hasattr(mask, 'cpu'):
-                        seg_images[f'region_mask_{i}'] = mask.cpu()
-                    else:
-                        seg_images[f'region_mask_{i}'] = torch.tensor(mask)
-                    
-                    # 生成可视化的语义分割图片
-                    try:
-                        # 使用Mask2Former的可视化方法
-                        vis_img = self.segmentor.visualize_panoptic_and_largest_stuff(
-                            x[i:i+1],  # 单个样本
-                            [seg_map],  # 单个分割图
-                            [mask],     # 单个掩码
-                            [region_names[i]]  # 单个区域名称
-                        )
-                        if vis_img is not None:
-                            seg_images[f'visualization_{i}'] = vis_img
-                    except Exception as e:
-                        if self.debug:
-                            self._log(f"语义分割可视化失败: {e}")
-                    
-                    # 创建简单的掩码可视化
-                    try:
-                        # 将掩码转换为彩色图片
-                        mask_tensor = mask if hasattr(mask, 'cpu') else torch.tensor(mask)
-                        if mask_tensor.dim() == 2:
-                            # 单通道掩码，转换为3通道彩色图片
-                            colored_mask = torch.zeros(3, mask_tensor.shape[0], mask_tensor.shape[1])
-                            colored_mask[0] = mask_tensor * 0.8  # 红色通道
-                            colored_mask[1] = mask_tensor * 0.2  # 绿色通道
-                            colored_mask[2] = mask_tensor * 0.1  # 蓝色通道
-                            seg_images[f'colored_mask_{i}'] = colored_mask
-                    except Exception as e:
-                        if self.debug:
-                            self._log(f"掩码可视化失败: {e}")
-                    
-                    # 尝试从seg_map中提取可视化信息
-                    if isinstance(seg_map, dict):
-                        # 如果是字典，尝试提取panoptic_seg
-                        if 'panoptic_seg' in seg_map:
-                            panoptic_seg = seg_map['panoptic_seg']
-                            if hasattr(panoptic_seg, 'cpu'):
-                                seg_images[f'panoptic_seg_{i}'] = panoptic_seg.cpu()
-                            else:
-                                seg_images[f'panoptic_seg_{i}'] = torch.tensor(panoptic_seg)
-                        
-                        # 尝试提取sem_seg
-                        if 'sem_seg' in seg_map:
-                            sem_seg = seg_map['sem_seg']
-                            if hasattr(sem_seg, 'cpu'):
-                                seg_images[f'sem_seg_{i}'] = sem_seg.cpu()
-                            else:
-                                seg_images[f'sem_seg_{i}'] = torch.tensor(sem_seg)
-            
-            # 只有当有有效图片时才保存
-            if seg_images:
-                self._save_attack_process('segmentation', seg_images, sample_idx=sample_idx)
-        
-        # CAM生成步骤
-        if self.target:
-            cam_list, cam_masks = self._generate_cam_and_masks(x, label=attack_id)
-        else:
-            cam_list, cam_masks = self._generate_cam_and_masks(x)
-        
-        if self.save_attack_process:
-            # 保存CAM结果
-            cam_images = {}
-            for i, (cam, mask) in enumerate(zip(cam_list, cam_masks)):
-                if i == 0:  # 只保存第一个样本
-                    # 确保cam和mask是tensor格式
-                    if hasattr(cam, 'cpu'):
-                        cam_images[f'cam_{i}'] = cam.cpu()
-                    else:
-                        cam_images[f'cam_{i}'] = torch.tensor(cam)
-                    
-                    if hasattr(mask, 'cpu'):
-                        cam_images[f'cam_mask_{i}'] = mask.cpu()
-                    else:
-                        cam_images[f'cam_mask_{i}'] = torch.tensor(mask)
-            self._save_attack_process('cam', cam_images, sample_idx=sample_idx)
-        
-        # 补丁位置选择
-        coords_list = self._select_patch_positions(x, region_masks, cam_masks)
-        
-        # 补丁生成步骤
-        if self.target:
-            patch_tensor = self._generate_patches(region_names, color_names, attack_id)
-        else:
-            patch_tensor = self._generate_patches(region_names, color_names)
-        
-        if self.save_attack_process:
-            # 保存生成的补丁
-            patch_images = {}
-            for i in range(min(3, patch_tensor.size(1))):  # 保存前3个补丁
-                patch_images[f'patch_{i}'] = patch_tensor[0, i]
-            self._save_attack_process('patches', patch_images, sample_idx=sample_idx)
-        
-        # 补丁融合步骤
-        patched_img = self._blend_patches(x, patch_tensor, coords_list)
-        if self.save_attack_process:
-            self._save_attack_process('blended', {'patched': patched_img[0]}, sample_idx=sample_idx)
-        
-        # 优化步骤
-        if self.target:
-            x_adv, step_preds_list = self._optimize(x, patched_img, coords_list, attack_id)
-        else:
-            x_adv, step_preds_list = self._optimize(x, patched_img, coords_list, y)
-        
-        if self.save_attack_process:
-            self._save_attack_process('adversarial', {'final': x_adv[0]}, sample_idx=sample_idx)
-
-        # 添加原始图像的预测结果到step_preds_list的开头
-        with torch.no_grad():
-            preds_orig = torch.argmax(self.model(x), dim=1)
-            step_preds_list.insert(0, preds_orig.detach().cpu())
-
-        return x_adv, step_preds_list
-
-    def _to_pil(self, x):
-        return [to_pil_image(x[i].cpu()) for i in range(x.shape[0])]
-
-    def _extract_colors(self, pil_imgs):
-        color_names = self.color_extractor.get_top_color_names_batch(pil_imgs, topk=3)
-        if self.debug:
-            self._log(f"Dominant colors: {color_names}")
-        return color_names
-
-    def _segment_semantics(self, x):
-        seg_maps = self.segmentor.segment_batch_panoptic(x)
-        names, masks = self.segmentor.get_largest_stuff_region_batch(seg_maps)
-        if self.save_imgs:
-            self._save_img(self.segmentor.visualize_panoptic_and_largest_stuff, x, seg_maps, masks, names)
-        if self.debug:
-            self._log(f"Segmented regions: {names}")
-        return seg_maps, names, masks
-
-    def _generate_cam_and_masks(self, x, label=None):
-        cams = self.cam_gen.generate_cam_batch(x, target_classes=label)
-        cam_masks = self.cam_gen.cam_to_mask_batch(cams, percentile=self.config["cam_percentile"])
-        if self.save_imgs:
-            self._save_img(self.cam_gen.save_cam_composite_4in1_batch, images_tensor=x, cams=cams, masks_batch=cam_masks)
-        if self.debug:
-            self._log(f"Generated CAMs for {len(cams)} images with masks.")
-        return cams, cam_masks
-
-    def _select_patch_positions(self, x, region_masks, cam_masks):
-        selector = PatchSelectorBatch(region_masks, x, self.config["patch_size"], cam_masks,self.config["cam_thresh_ratio"], self.config["mask_thresh_ratio"])
-        coords = selector.get_best_patch_positions(k=self.config["patch_k"], stride_ratio=0.5)
-        if self.save_imgs:    
-            self._save_img(selector.visualize_patch_selection, x, coords)
-        return coords
-
-    def _generate_patches(self, region_names, color_names, target_classes=None):
-        if self.target:
-            patches, prompts = self.patch_gen.generate_patch_by_region_batch(
-                region_names=region_names,
-                color_names_list=color_names,
-                patch_size=self.config["patch_size"],
-                per_region_k=self.config["patch_k"],
-                target_classes=target_classes
-            )
-        else:
-            patches, prompts = self.patch_gen.generate_patch_by_region_batch(
-                region_names=region_names,
-                color_names_list=color_names,
-                patch_size=self.config["patch_size"],
-                per_region_k=self.config["patch_k"]
-            )
-        if self.debug:
-            self._log(f"Prompts: {prompts}")
-        if self.save_imgs:
-            self._save_img(self.patch_gen.visualize_patch_batch_with_prompts, patch_batch=patches, prompts_batch=prompts)
-        to_tensor = transforms.ToTensor()
-        return torch.stack([torch.stack([to_tensor(p) for p in plist]) for plist in patches]).to(self.device)
-
-    def _blend_patches(self, x, patch_tensor, coords):
-        if self.debug:
-            self._log(f"Blending patches into images at coordinates: {coords}")
-        blended = self.patch_blender.blend_patch_tensor_batch(
-            backgrounds=x,
-            patches=patch_tensor,
-            positions=coords,
-            blend_width=self.config["blend_width"]
-        )
-        if self.debug:
-            self._log(f"Blended patches into images.")
-        if self.save_imgs:
-            self._save_img(self.patch_blender.visualize_patch_blending_batch, x, patch_tensor, coords, blended)
-        
-        return blended
-
-    def _optimize(self, x, patched_x, coords, y_or_target):
-        targeted = self.config["targeted_attack"]
-        if self.debug:
-            self._log(f"Optimizing adversarial images with coordinates: {coords} and target: {y_or_target}")
-        # 使用return_step_preds=True来获取每步预测结果
-        result = self.optimizer.optimize_batch(x, patched_x, coords, y_or_target, targeted=targeted, return_step_preds=True)
-        if isinstance(result, tuple):
-            x_adv, step_preds_list = result
-        else:
-            x_adv = result
-            step_preds_list = []
-            
-        if self.debug:
-            self._log(f"Optimized adversarial images with targeted={targeted}.")
-        if self.save_imgs:
-            self._save_img(self.optimizer.visualize_adversarial_comparison, x=x, x_adv=x_adv)
-        return x_adv, step_preds_list
 
 
 class MyPatchAttack:
-    """基础版本的MyPatchAttack，只返回对抗样本"""
-    
-    def __init__(self, model, device='cuda', config=None, debug=False, save_imgs=False, save_attack_process=False):
+    _evaluation = False
+
+    def __init__(self, model, device="cuda", config=None, debug=False,
+                 save_imgs=False, save_attack_process=False, components=None):
         self.device = torch.device(device)
-        self.model = model.to(self.device).eval()
-        self.debug = debug
-        self.save_imgs = save_imgs
-        self.save_attack_process = save_attack_process  # 新增：是否保存攻击过程
-
-        self.config = {**DEFAULT_CONFIG, **(config or {})}
-        self._init_modules()
-        self._init_logger()
-        self._init_timestamp()
-        self.target = self.config["targeted_attack"]
-        if self.target:
-            self.rm.log("[Targeted Attack] 启动目标攻击模式")
-        else:
-            self.rm.log("[Non-targeted Attack] 启动非目标攻击模式")
-        
-    def _init_modules(self):
-        self.segmentor = SemanticSegmentor()
-        self.patch_gen = PatchGenerator(device=self.device)
-        self.color_extractor = ColorExtractor()
-        self.patch_blender = PatchBlender(blend_width=self.config["blend_width"])
-        self.optimizer = PatchOptimizer(device=self.device, steps=self.config["steps"], eps=self.config["eps"], alpha=self.config["alpha"], model=self.model)
-        self.cam_gen = CAMGenerator(model_name=self.config["cam_model_name"], device=str(self.device))
-
-    def _init_logger(self):
-        self.rm = ResultManager.get_instance() 
-        if self.rm:
-            if self.debug:
-                self.rm.log("[Debug Mode] 启动MyPatchAttack调试模式")
-
-    def _init_timestamp(self):
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
+        self.config.update(copy.deepcopy(config or {}))
+        if isinstance(self.config.get("patch_size"), list):
+            self.config["patch_size"] = tuple(self.config["patch_size"])
+        classifier_size = (299, 299) if self.config.get("cam_model_name") == "inception_v3" else (224, 224)
+        self.model = ensure_imagenet_normalized(model, input_size=classifier_size).to(self.device).eval()
+        self.debug = bool(debug)
+        self.save_imgs = bool(save_imgs)
+        self.save_attack_process = bool(save_attack_process)
+        self.target = bool(self.config["targeted_attack"])
+        self.rm = ResultManager.get_instance() if (self.debug or self.save_imgs or self.save_attack_process) else None
         self._timestamp = datetime.now().strftime("%Y%m%dT%H%M%S") if self.save_imgs else None
+        self.last_diagnostics = {}
+        self._init_modules(components or {})
+        self._log(f"Attack mode: {'targeted' if self.target else 'untargeted'}")
 
-    def _log(self, msg):
+    def _init_modules(self, components):
+        scene_aware = self.config.get("scene_aware_placement", True)
+        diffusion_init = self.config.get("diffusion_init", True)
+        self.segmentor = components.get("segmentor")
+        if self.segmentor is None and scene_aware:
+            self.segmentor = SemanticSegmentor(
+                device=self.device,
+                checkpoint=self.config.get("mask2former_checkpoint", "facebook/mask2former-swin-base-ade-panoptic"),
+                local_files_only=self.config.get("mask2former_local_files_only", False),
+            )
+        self.patch_gen = components.get("patch_gen")
+        if self.patch_gen is None and diffusion_init:
+            self.patch_gen = PatchGenerator(
+                model_path=self.config.get("stable_diffusion_checkpoint", "stable-diffusion-v1-5/stable-diffusion-v1-5"),
+                device=self.device,
+                local_files_only=self.config.get("stable_diffusion_local_files_only", False),
+                disable_safety_checker=self.config.get("disable_safety_checker", False),
+                seed=self.config.get("seed", 42),
+                num_inference_steps=self.config.get("diffusion_steps", 20),
+                guidance_scale=self.config.get("diffusion_guidance_scale", 7.5),
+            )
+        self.color_extractor = components.get("color_extractor") or ColorExtractor(
+            n_colors=self.config.get("n_colors", 3), random_state=self.config.get("seed", 42)
+        )
+        self.patch_blender = components.get("patch_blender") or PatchBlender(
+            blend_width=self.config["blend_width"]
+        )
+        self.optimizer = components.get("optimizer") or PatchOptimizer(
+            device=self.device, steps=self.config["steps"], eps=self.config["eps"],
+            alpha=self.config["alpha"], decay=self.config.get("decay", 1.0), model=self.model,
+            lambda_adv=self.config.get("lambda_adv", 1.0),
+            lambda_smooth=self.config.get("lambda_smooth", 0.1),
+            lambda_color=self.config.get("lambda_color", 0.05),
+            use_momentum=self.config.get("use_momentum", True),
+        )
+        self.cam_gen = components.get("cam_gen")
+        if self.cam_gen is None and scene_aware:
+            self.cam_gen = CAMGenerator(
+                model_name=self.config["cam_model_name"], device=self.device, model=self.model,
+                input_normalized=self.config.get("input_normalized", False),
+                input_size=self.config.get("cam_input_size"),
+            )
+
+    def _log(self, message):
         if self.debug and self.rm:
-            self.rm.log(f"[Debug] {msg}")
+            self.rm.log(f"[Debug] {message}")
 
     def _save_img(self, vis_func, *args, **kwargs):
         if self.save_imgs:
             vis_func(*args, save_dir=self.rm.img_dir, timestamp_str=self._timestamp, show=False, **kwargs)
 
     def _save_attack_process(self, step_name, images_dict, sample_idx=0):
-        """保存攻击过程的各个步骤图片
-        
-        Args:
-            step_name: 步骤名称，如 'original', 'segmentation', 'cam', 'patches', 'blended', 'adversarial'
-            images_dict: 包含图片的字典，键为图片名称，值为图片tensor或PIL图像
-            sample_idx: 样本索引
-        """
         if not self.save_attack_process:
             return
-            
-        import os
-        from PIL import Image
-        import torchvision.utils as vutils
-        
-        # 创建攻击过程保存目录
-        process_dir = os.path.join(self.rm.img_dir, "attack_process")
-        os.makedirs(process_dir, exist_ok=True)
-        
-        # 为每个样本创建子目录
-        sample_dir = os.path.join(process_dir, f"sample_{sample_idx}")
+        sample_dir = os.path.join(self.rm.img_dir, "attack_process", f"sample_{sample_idx}")
         os.makedirs(sample_dir, exist_ok=True)
-        
-        # 保存每个步骤的图片
-        for img_name, img in images_dict.items():
-            if img is None:
+        for name, image in images_dict.items():
+            if image is None:
                 continue
-                
-            # 确保图片是tensor格式
-            if isinstance(img, Image.Image):
-                img = transforms.ToTensor()(img)
-            elif isinstance(img, np.ndarray):
-                img = torch.from_numpy(img).float()
-                
-            # 确保是3D tensor [C, H, W]
-            if img.dim() == 4:
-                img = img[0]  # 取第一个样本
-            elif img.dim() == 2:
-                img = img.unsqueeze(0).repeat(3, 1, 1)  # 灰度图转RGB
-            
-            # 处理数据类型和值范围
-            if img.dtype != torch.float32:
-                img = img.float()
-                
-            # 确保值在[0,1]范围内
-            if img.max() > 1.0:
-                img = img / 255.0
-                
-            # 保存图片
-            filename = f"{step_name}_{img_name}.png"
-            filepath = os.path.join(sample_dir, filename)
-            vutils.save_image(img, filepath)
-            
-        if self.debug:
-            self._log(f"保存攻击过程图片: {step_name} -> {sample_dir}")
-
-    def run(self, x, y, target=None, sample_idx=0):
-        # 若为目标攻击，使用target；否则使用真实标签y
-        attack_id = target if self.target and target is not None else y
-        
-        # 保存原始图片
-        if self.save_attack_process:
-            self._save_attack_process('original', {'input': x[0]}, sample_idx=sample_idx)
-        
-        pil_imgs = self._to_pil(x)
-        color_names = self._extract_colors(pil_imgs)
-        
-        # 语义分割步骤
-        seg_maps, region_names, region_masks = self._segment_semantics(x)
-        if self.save_attack_process:
-            # 保存分割结果
-            seg_images = {}
-            for i, (seg_map, mask) in enumerate(zip(seg_maps, region_masks)):
-                if i == 0:  # 只保存第一个样本
-                    # 保存region_mask（tensor格式）
-                    if hasattr(mask, 'cpu'):
-                        seg_images[f'region_mask_{i}'] = mask.cpu()
-                    else:
-                        seg_images[f'region_mask_{i}'] = torch.tensor(mask)
-                    
-                    # 生成可视化的语义分割图片
-                    try:
-                        # 使用Mask2Former的可视化方法
-                        vis_img = self.segmentor.visualize_panoptic_and_largest_stuff(
-                            x[i:i+1],  # 单个样本
-                            [seg_map],  # 单个分割图
-                            [mask],     # 单个掩码
-                            [region_names[i]]  # 单个区域名称
-                        )
-                        if vis_img is not None:
-                            seg_images[f'visualization_{i}'] = vis_img
-                    except Exception as e:
-                        if self.debug:
-                            self._log(f"语义分割可视化失败: {e}")
-                    
-                    # 创建简单的掩码可视化
-                    try:
-                        # 将掩码转换为彩色图片
-                        mask_tensor = mask if hasattr(mask, 'cpu') else torch.tensor(mask)
-                        if mask_tensor.dim() == 2:
-                            # 单通道掩码，转换为3通道彩色图片
-                            colored_mask = torch.zeros(3, mask_tensor.shape[0], mask_tensor.shape[1])
-                            colored_mask[0] = mask_tensor * 0.8  # 红色通道
-                            colored_mask[1] = mask_tensor * 0.2  # 绿色通道
-                            colored_mask[2] = mask_tensor * 0.1  # 蓝色通道
-                            seg_images[f'colored_mask_{i}'] = colored_mask
-                    except Exception as e:
-                        if self.debug:
-                            self._log(f"掩码可视化失败: {e}")
-                    
-                    # 尝试从seg_map中提取可视化信息
-                    if isinstance(seg_map, dict):
-                        # 如果是字典，尝试提取panoptic_seg
-                        if 'panoptic_seg' in seg_map:
-                            panoptic_seg = seg_map['panoptic_seg']
-                            if hasattr(panoptic_seg, 'cpu'):
-                                seg_images[f'panoptic_seg_{i}'] = panoptic_seg.cpu()
-                            else:
-                                seg_images[f'panoptic_seg_{i}'] = torch.tensor(panoptic_seg)
-                        
-                        # 尝试提取sem_seg
-                        if 'sem_seg' in seg_map:
-                            sem_seg = seg_map['sem_seg']
-                            if hasattr(sem_seg, 'cpu'):
-                                seg_images[f'sem_seg_{i}'] = sem_seg.cpu()
-                            else:
-                                seg_images[f'sem_seg_{i}'] = torch.tensor(sem_seg)
-            
-            # 只有当有有效图片时才保存
-            if seg_images:
-                self._save_attack_process('segmentation', seg_images, sample_idx=sample_idx)
-        
-        # CAM生成步骤
-        if self.target:
-            cam_list, cam_masks = self._generate_cam_and_masks(x, label=attack_id)
-        else:
-            cam_list, cam_masks = self._generate_cam_and_masks(x)
-        
-        if self.save_attack_process:
-            # 保存CAM结果
-            cam_images = {}
-            for i, (cam, mask) in enumerate(zip(cam_list, cam_masks)):
-                if i == 0:  # 只保存第一个样本
-                    # 确保cam和mask是tensor格式
-                    if hasattr(cam, 'cpu'):
-                        cam_images[f'cam_{i}'] = cam.cpu()
-                    else:
-                        cam_images[f'cam_{i}'] = torch.tensor(cam)
-                    
-                    if hasattr(mask, 'cpu'):
-                        cam_images[f'cam_mask_{i}'] = mask.cpu()
-                    else:
-                        cam_images[f'cam_mask_{i}'] = torch.tensor(mask)
-            self._save_attack_process('cam', cam_images, sample_idx=sample_idx)
-        
-        # 补丁位置选择
-        coords_list = self._select_patch_positions(x, region_masks, cam_masks)
-        
-        # 补丁生成步骤
-        if self.target:
-            patch_tensor = self._generate_patches(region_names, color_names, attack_id)
-        else:
-            patch_tensor = self._generate_patches(region_names, color_names)
-        
-        if self.save_attack_process:
-            # 保存生成的补丁
-            patch_images = {}
-            for i in range(min(3, patch_tensor.size(1))):  # 保存前3个补丁
-                patch_images[f'patch_{i}'] = patch_tensor[0, i]
-            self._save_attack_process('patches', patch_images, sample_idx=sample_idx)
-        
-        # 补丁融合步骤
-        patched_img = self._blend_patches(x, patch_tensor, coords_list)
-        if self.save_attack_process:
-            self._save_attack_process('blended', {'patched': patched_img[0]}, sample_idx=sample_idx)
-        
-        # 优化步骤
-        if self.target:
-            x_adv = self._optimize(x, patched_img, coords_list, attack_id)
-        else:
-            x_adv = self._optimize(x, patched_img, coords_list, y)
-        
-        if self.save_attack_process:
-            self._save_attack_process('adversarial', {'final': x_adv[0]}, sample_idx=sample_idx)
-        
-        return x_adv
+            if isinstance(image, Image.Image):
+                tensor = TF.to_tensor(image)
+            else:
+                tensor = torch.as_tensor(image).detach().cpu()
+            if tensor.ndim == 4:
+                tensor = tensor[0]
+            if tensor.ndim == 2:
+                tensor = tensor.unsqueeze(0).repeat(3, 1, 1)
+            tensor = tensor.float()
+            if tensor.numel() and tensor.max() > 1:
+                tensor = tensor / 255.0
+            vutils.save_image(tensor.clamp(0, 1), os.path.join(sample_dir, f"{step_name}_{name}.png"))
 
     def _to_pil(self, x):
-        return [to_pil_image(x[i].cpu()) for i in range(x.shape[0])]
+        return [TF.to_pil_image(image.detach().cpu()) for image in x]
 
-    def _extract_colors(self, pil_imgs):
-        color_names = self.color_extractor.get_top_color_names_batch(pil_imgs, topk=3)
-        if self.debug:
-            self._log(f"Dominant colors: {color_names}")
-        return color_names
+    def _extract_colors(self, pil_imgs, coords_list=None):
+        palettes = []
+        for index, image in enumerate(pil_imgs):
+            pixel_mask = None
+            if coords_list is not None:
+                pixel_mask = np.zeros((image.height, image.width), dtype=bool)
+                for x1, y1, x2, y2 in coords_list[index]:
+                    pixel_mask[y1:y2, x1:x2] = True
+            palettes.append(self.color_extractor.get_dominant_palette(image, pixel_mask=pixel_mask))
+        self._palette_rgb = [palette["rgb"] for palette in palettes]
+        self._palette_lab = [palette["lab"] for palette in palettes]
+        names = [palette["names"] for palette in palettes]
+        if not self.config.get("use_color_info", True):
+            return [[] for _ in names]
+        return names
 
     def _segment_semantics(self, x):
+        if self.segmentor is None:
+            raise RuntimeError("Semantic segmentation is required but no segmentor is configured")
         seg_maps = self.segmentor.segment_batch_panoptic(x)
-        names, masks = self.segmentor.get_largest_stuff_region_batch(seg_maps)
+        try:
+            names, masks = self.segmentor.get_largest_stuff_region_batch(seg_maps)
+        except ValueError as exc:
+            if "no non-empty stuff" not in str(exc):
+                raise
+            self._selection_diagnostics = [{
+                "fallback_triggered": False,
+                "relaxation_steps": 0,
+                "unresolved_reason": "no_non_empty_stuff",
+            } for _ in range(x.shape[0])]
+            raise UnresolvedPlacementError("No non-empty panoptic stuff region is available") from exc
         if self.save_imgs:
             self._save_img(self.segmentor.visualize_panoptic_and_largest_stuff, x, seg_maps, masks, names)
-        if self.debug:
-            self._log(f"Segmented regions: {names}")
         return seg_maps, names, masks
 
     def _generate_cam_and_masks(self, x, label=None):
+        if self.cam_gen is None:
+            raise RuntimeError("CAM is required but no CAM generator is configured")
         cams = self.cam_gen.generate_cam_batch(x, target_classes=label)
-        cam_masks = self.cam_gen.cam_to_mask_batch(cams, percentile=self.config["cam_percentile"])
+        if cams.shape[-2:] != x.shape[-2:]:
+            cams = torch.nn.functional.interpolate(
+                cams.unsqueeze(1), size=x.shape[-2:], mode="bilinear", align_corners=False
+            )[:, 0]
+        masks = self.cam_gen.cam_to_mask_batch(cams, percentile=self.config["cam_percentile"])
         if self.save_imgs:
-            self._save_img(self.cam_gen.save_cam_composite_4in1_batch, images_tensor=x, cams=cams, masks_batch=cam_masks)
-        if self.debug:
-            self._log(f"Generated CAMs for {len(cams)} images with masks.")
-        return cams, cam_masks
+            self._save_img(self.cam_gen.save_cam_composite_4in1_batch,
+                           images_tensor=x, cams=cams, masks_batch=masks)
+        return cams, masks
 
     def _select_patch_positions(self, x, region_masks, cam_masks):
-        selector = PatchSelectorBatch(region_masks, x, self.config["patch_size"], cam_masks,self.config["cam_thresh_ratio"], self.config["mask_thresh_ratio"])
+        selector = PatchSelectorBatch(
+            binary_masks_batch=region_masks,
+            rgb_images_batch=x,
+            patch_size=self.config["patch_size"],
+            cam_masks_batch=cam_masks,
+            cam_thresh_ratio=self.config["cam_thresh_ratio"],
+            mask_thresh_ratio=self.config["mask_thresh_ratio"],
+            relaxation_steps=self.config.get("selection_relaxation_steps", 4),
+            fallback_policy=self.config.get("selection_fallback_policy", "best"),
+        )
         coords = selector.get_best_patch_positions(k=self.config["patch_k"], stride_ratio=0.5)
-        if self.save_imgs:    
+        self._selection_diagnostics = selector.get_diagnostics()
+        if self.save_imgs:
             self._save_img(selector.visualize_patch_selection, x, coords)
         return coords
 
+    def _sample_seed(self, sample_idx, offset=0):
+        payload = f"{self.config.get('seed', 42)}:{sample_idx}:{offset}".encode("utf-8")
+        return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2 ** 63)
+
+    def _random_patch_positions(self, x, sample_idx):
+        """Seeded random Stage-2 ablation without changing later stages."""
+        rng = random.Random(self._sample_seed(sample_idx, offset=17))
+        height, width = x.shape[-2:]
+        ph, pw = self.config["patch_size"]
+        if ph > height or pw > width:
+            raise ValueError(f"Patch size {(ph, pw)} does not fit image {(height, width)}")
+        coords = []
+        for _batch_index in range(x.shape[0]):
+            sample = []
+            for _ in range(self.config["patch_k"]):
+                x1 = rng.randint(0, width - pw)
+                y1 = rng.randint(0, height - ph)
+                sample.append((x1, y1, x1 + pw, y1 + ph))
+            coords.append(sample)
+        self._selection_diagnostics = [{
+            "fallback_triggered": False,
+            "relaxation_steps": 0,
+            "placement_strategy": "seeded_random",
+            "random_seed": self._sample_seed(sample_idx, offset=17),
+        } for _ in range(x.shape[0])]
+        return coords
+
+    def _validate_external_coords(self, coords, x):
+        if not isinstance(coords, (list, tuple)) or len(coords) != x.shape[0]:
+            raise ValueError("coords must contain one coordinate list per input image")
+        validated = []
+        height, width = x.shape[-2:]
+        for sample_coords in coords:
+            if not sample_coords:
+                raise ValueError("External coords cannot contain an empty sample")
+            sample = []
+            for coord in sample_coords:
+                if len(coord) != 4:
+                    raise ValueError(f"Invalid coordinate {coord!r}")
+                x1, y1, x2, y2 = (int(value) for value in coord)
+                if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+                    raise ValueError(f"Coordinate {coord!r} is outside image {(height, width)}")
+                sample.append((x1, y1, x2, y2))
+            validated.append(sample)
+        return validated
+
     def _generate_patches(self, region_names, color_names, target_classes=None):
-        if self.target:
-            patches, prompts = self.patch_gen.generate_patch_by_region_batch(
-                region_names=region_names,
-                color_names_list=color_names,
-                patch_size=self.config["patch_size"],
-                per_region_k=self.config["patch_k"],
-                target_classes=target_classes
-            )
-        else:
-            patches, prompts = self.patch_gen.generate_patch_by_region_batch(
-                region_names=region_names,
-                color_names_list=color_names,
-                patch_size=self.config["patch_size"],
-                per_region_k=self.config["patch_k"]
-            )
-        if self.debug:
-            self._log(f"Prompts: {prompts}")
+        if self.patch_gen is None:
+            raise RuntimeError("Diffusion initialisation is enabled but no patch generator is configured")
+        patches, prompts = self.patch_gen.generate_patch_by_region_batch(
+            region_names=region_names,
+            color_names_list=color_names,
+            patch_size=self.config["patch_size"],
+            per_region_k=self.config["patch_k"],
+            target_classes=target_classes,
+            num_inference_steps=self.config.get("diffusion_steps", 20),
+            guidance_scale=self.config.get("diffusion_guidance_scale", 7.5),
+        )
+        self._last_prompts = prompts
         if self.save_imgs:
-            self._save_img(self.patch_gen.visualize_patch_batch_with_prompts, patch_batch=patches, prompts_batch=prompts)
-        to_tensor = transforms.ToTensor()
-        return torch.stack([torch.stack([to_tensor(p) for p in plist]) for plist in patches]).to(self.device)
+            self._save_img(self.patch_gen.visualize_patch_batch_with_prompts,
+                           patch_batch=patches, prompts_batch=prompts)
+        return torch.stack([
+            torch.stack([TF.to_tensor(patch) for patch in sample]) for sample in patches
+        ]).to(self.device)
+
+    def _generate_noise_patches(self, batch_size, sample_idx):
+        """Seeded uniform-noise initialisation for the no-diffusion ablation."""
+        height, width = self.config["patch_size"]
+        k = self.config["patch_k"]
+        generator = torch.Generator(device=self.device).manual_seed(self._sample_seed(sample_idx, offset=29))
+        patches = torch.rand((batch_size, k, 3, height, width), generator=generator, device=self.device)
+        self._last_prompts = [["seeded_noise_initialisation"] * k for _ in range(batch_size)]
+        return patches
 
     def _blend_patches(self, x, patch_tensor, coords):
-        if self.debug:
-            self._log(f"Blending patches into images at coordinates: {coords}")
         blended = self.patch_blender.blend_patch_tensor_batch(
-            backgrounds=x,
-            patches=patch_tensor,
-            positions=coords,
-            blend_width=self.config["blend_width"]
+            backgrounds=x, patches=patch_tensor, positions=coords,
+            blend_width=self.config["blend_width"],
         )
-        if self.debug:
-            self._log(f"Blended patches into images.")
         if self.save_imgs:
             self._save_img(self.patch_blender.visualize_patch_blending_batch, x, patch_tensor, coords, blended)
-        
         return blended
 
     def _optimize(self, x, patched_x, coords, y_or_target):
-        targeted = self.config["targeted_attack"]
-        if self.debug:
-            self._log(f"Optimizing adversarial images with coordinates: {coords} and target: {y_or_target}")
-        x_adv = self.optimizer.optimize_batch(x, patched_x, coords, y_or_target, targeted=targeted)
-        if self.debug:
-            self._log(f"Optimized adversarial images with targeted={targeted}.")
+        palettes = getattr(self, "_palette_lab", None)
+        result = self.optimizer.optimize_batch(
+            x, patched_x, coords, y_or_target,
+            palette_lab=palettes,
+            targeted=self.target,
+            return_step_preds=self._evaluation,
+            use_momentum=self.config.get("use_momentum", True),
+        )
         if self.save_imgs:
-            self._save_img(self.optimizer.visualize_adversarial_comparison, x=x, x_adv=x_adv)
-        return x_adv 
+            self._save_img(self.optimizer.visualize_adversarial_comparison,
+                           x=x, x_adv=result[0] if isinstance(result, tuple) else result)
+        return result
+
+    def run(self, x, y, target=None, sample_idx=0, coords=None,
+            return_info=False, diagnostics=False, diagnostics_path=None):
+        """Run the pipeline without suppressing stage failures.
+
+        ``coords`` strictly reuses Stage-2 ``(x1,y1,x2,y2)`` patch coordinates.
+        ``return_info`` (or ``diagnostics=True``) adds a JSON-compatible info dict.
+        """
+        if not isinstance(x, torch.Tensor) or x.ndim != 4 or x.shape[1] != 3:
+            raise ValueError("x must have shape [B,3,H,W]")
+        x = x.to(self.device).float()
+        if x.numel() and (x.min() < 0 or x.max() > 1):
+            raise ValueError("x must contain unnormalised RGB values in [0,1]")
+        y = torch.as_tensor(y, dtype=torch.long, device=self.device).reshape(-1)
+        if y.numel() == 1 and x.shape[0] > 1:
+            y = y.expand(x.shape[0])
+        if y.numel() != x.shape[0]:
+            raise ValueError("y must contain one label per input image")
+        if self.target and target is None:
+            if self.config.get("target_class") is None:
+                raise ValueError("target is required when targeted_attack=True and target_class is not configured")
+            target = torch.full((x.shape[0],), int(self.config["target_class"]), dtype=torch.long, device=self.device)
+        attack_id = target if self.target else y
+        attack_id = torch.as_tensor(attack_id, dtype=torch.long, device=self.device).reshape(-1)
+        if attack_id.numel() == 1 and x.shape[0] > 1:
+            attack_id = attack_id.expand(x.shape[0])
+        if attack_id.numel() != x.shape[0]:
+            raise ValueError("target must contain one class per input image")
+
+        profiler = StageProfiler(self.device)
+        profiler.start()
+        info = {
+            "status": "running",
+            "sample_idx": sample_idx,
+            "seed": self.config.get("seed", 42),
+            "coords_source": "external" if coords is not None else "selector",
+            "config": copy.deepcopy(self.config),
+            "failure_reason": None,
+        }
+        self.last_diagnostics = info
+        self._selection_diagnostics = None
+        self._last_prompts = None
+        self._palette_rgb = [[] for _ in range(x.shape[0])]
+        self._palette_lab = [[] for _ in range(x.shape[0])]
+        try:
+            pil_images = self._to_pil(x)
+            if self.config.get("scene_aware_placement", True):
+                with profiler.stage("segmentation"):
+                    _seg_maps, region_names, region_masks = self._segment_semantics(x)
+                with profiler.stage("cam"):
+                    _cams, cam_masks = self._generate_cam_and_masks(x, label=attack_id)
+            else:
+                region_names = ["uniform_scene"] * x.shape[0]
+                region_masks = [torch.ones(x.shape[-2:], dtype=torch.uint8, device=self.device) for _ in range(x.shape[0])]
+                cam_masks = [torch.zeros(x.shape[-2:], dtype=torch.uint8, device=self.device) for _ in range(x.shape[0])]
+            with profiler.stage("selection"):
+                if coords is not None:
+                    coords_list = self._validate_external_coords(coords, x)
+                elif self.config.get("placement_strategy", "scene_aware") == "random":
+                    coords_list = self._random_patch_positions(x, sample_idx)
+                else:
+                    coords_list = self._select_patch_positions(x, region_masks, cam_masks)
+            with profiler.stage("color"):
+                # The palette and prompt colours come from the actual Stage-2 window.
+                color_names = self._extract_colors(pil_images, coords_list=coords_list)
+            with profiler.stage("diffusion"):
+                if self.config.get("diffusion_init", True):
+                    patch_tensor = self._generate_patches(
+                        region_names, color_names, attack_id if self.target else None
+                    )
+                else:
+                    patch_tensor = self._generate_noise_patches(x.shape[0], sample_idx)
+            with profiler.stage("blending"):
+                patched = self._blend_patches(x, patch_tensor, coords_list)
+            with profiler.stage("optimization"):
+                optimized = self._optimize(x, patched, coords_list, attack_id)
+            if isinstance(optimized, tuple):
+                x_adv, step_preds = optimized
+            else:
+                x_adv, step_preds = optimized, []
+            if self._evaluation:
+                with torch.no_grad():
+                    original_preds = self.model(x).argmax(dim=1).detach().cpu()
+                step_preds = [original_preds] + list(step_preds)
+            info.update({
+                "status": "success",
+                "coords": coords_list,
+                "selection": self._selection_diagnostics,
+                "palette_rgb": self._palette_rgb,
+                "palette_lab": self._palette_lab,
+                "color_names": color_names,
+                "prompts": self._last_prompts,
+                "optimizer": self.optimizer.last_diagnostics,
+            })
+            if self.save_attack_process:
+                self._save_attack_process("adversarial", {"final": x_adv[0]}, sample_idx=sample_idx)
+        except Exception as exc:
+            info.update({
+                "status": "unresolved" if isinstance(exc, UnresolvedPlacementError) else "failed",
+                "failure_reason": f"{type(exc).__name__}: {exc}",
+                "coords": locals().get("coords_list"),
+                "selection": self._selection_diagnostics,
+            })
+            raise
+        finally:
+            info["profiling"] = profiler.summary()
+            self.last_diagnostics = info
+            if diagnostics_path is not None:
+                save_diagnostics(info, diagnostics_path)
+
+        wants_info = return_info or diagnostics
+        if self._evaluation:
+            return (x_adv, step_preds, info) if wants_info else (x_adv, step_preds)
+        return (x_adv, info) if wants_info else x_adv
+
+
+class MyPatchAttack_Eva(MyPatchAttack):
+    """Evaluation variant preserving ``(tensor, step_preds)`` by default."""
+
+    _evaluation = True

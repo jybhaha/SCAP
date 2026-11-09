@@ -7,15 +7,15 @@ import torch
 import torchvision.transforms.functional as TF
 import os
 from typing import List
-from utils.result_saver import ResultManager
 
 class PatchBlender:
     def __init__(self, blend_width=10):
         """
         blend_width: 边缘渐变融合宽度，单位像素
         """
-        self.blend_width = blend_width
-        self.rm = ResultManager.get_instance()  # 获取结果管理器实例
+        self.blend_width = int(blend_width)
+        if self.blend_width < 0:
+            raise ValueError("blend_width must be non-negative")
 
     def color_match(self, patch, bg_region):
         """
@@ -137,7 +137,10 @@ class PatchBlender:
         dist_edge = torch.minimum(torch.minimum(dist_top, dist_bottom),
                                 torch.minimum(dist_left, dist_right)).float()
 
-        alpha = (dist_edge / blend_width).clamp(0, 1)  # [ph, pw]
+        if blend_width < 0:
+            raise ValueError("blend_width must be non-negative")
+        alpha = ((dist_edge / blend_width).clamp(0, 1) if blend_width > 0
+                 else torch.ones_like(dist_edge))  # [ph, pw]; zero disables boundary fusion
         alpha = alpha.unsqueeze(0)  # [1, ph, pw]，每通道相同
         #self.rm.log(f"Alpha mask created with blend width {blend_width} pixels.")
         for b in range(B):

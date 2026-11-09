@@ -1,310 +1,268 @@
-import torch
+"""Pixel and patch baselines with explicit controlled-coordinate protocols."""
 
-from torchattacks.attacks.pgd import PGD_Eva 
+from __future__ import annotations
+
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as T
+
+from models.imagenet_model import ensure_imagenet_normalized
+from torchattacks.attacks.pgd import PGD_Eva
 from torchattacks.attacks.fgsm import FGSM_Eva
 from torchattacks.attacks.mifgsm import MIFGSM_Eva
 from torchattacks.attacks.difgsm import DIFGSM_Eva
 from torchattacks.attacks.nifgsm import NIFGSM_Eva
 from torchattacks.attacks.vnifgsm import VNIFGSM_Eva
-from torch.autograd import Variable
-import torch.nn.functional as F
 from utils.result_saver import ResultManager
 
+
 class PixelAttackBaseline:
-    def __init__(self, model, eps=8/255, default_steps=10):
-        self.model = model
+    def __init__(self, model, eps=8 / 255, default_steps=10):
+        self.model = ensure_imagenet_normalized(model)
         self.eps = eps
         self.steps = default_steps
         self.result_manager = ResultManager.get_instance()
 
     def get_attack(self, name, **kwargs):
         name = name.upper()
-        #self.result_manager.log(f"Initializing {name} attack with eps={self.eps}")
         if name == "FGSM":
             return FGSM_Eva(self.model, eps=self.eps)
-        elif name == "MIFGSM":
+        if name == "MIFGSM":
             return MIFGSM_Eva(self.model, eps=self.eps, steps=self.steps, decay=1.0, **kwargs)
-        elif name == "DIFGSM":
+        if name == "DIFGSM":
             return DIFGSM_Eva(self.model, eps=self.eps, steps=self.steps, diversity_prob=0.7, **kwargs)
-        elif name == "NIFGSM":
+        if name == "NIFGSM":
             return NIFGSM_Eva(self.model, eps=self.eps, steps=self.steps, **kwargs)
-        elif name == "PGD":
-            return PGD_Eva(self.model, eps=self.eps, alpha=2/255, steps=self.steps, **kwargs)
-        elif name == "VNIFGSM":
+        if name == "PGD":
+            return PGD_Eva(self.model, eps=self.eps, alpha=2 / 255, steps=self.steps, **kwargs)
+        if name == "VNIFGSM":
             return VNIFGSM_Eva(self.model, eps=self.eps, steps=self.steps, **kwargs)
-        else:
-            raise ValueError(f"Unsupported attack type: {name}")
+        raise ValueError(f"Unsupported attack type: {name}")
 
     def run(self, attack_name, x, y, target=None, **kwargs):
         attack = self.get_attack(attack_name, **kwargs)
+        if target is not None and hasattr(attack, "set_mode_targeted_by_label"):
+            attack.set_mode_targeted_by_label(quiet=True)
+        return attack(x, target if target is not None else y)
 
-        # 🔑 设置目标攻击模式
-        if target is not None:
-            if hasattr(attack, "set_mode_targeted_by_label"):
-                attack.set_mode_targeted_by_label(quiet=True)
-            labels = target
-        else:
-            labels = y
-
-        # ✅ 调用 attack（兼容 __call__ 或 forward）
-        if hasattr(attack, "__call__"):
-            x_adv = attack(x, labels)
-        else:
-            x_adv = attack.forward(x, labels)
-
-        return x_adv
-
-
-
-
-import torch
-import torchvision.transforms as T
-from PIL import Image
-import numpy as np
-
-# ART 相关
-from art.estimators.classification import PyTorchClassifier
-from art.attacks.evasion import DPatch, AdversarialPatch
 
 class PatchAttackBaseline:
-    def __init__(self, model, input_size=(224, 224), device='cuda', num_classes=1000):
-        self.model = model.to(device).eval()
+    """Patch attacks optimised directly inside externally supplied Stage-2 boxes."""
+
+    def __init__(self, model, input_size=(224, 224), device="cuda", num_classes=1000):
+        self.model = ensure_imagenet_normalized(model).to(device).eval()
         self.input_size = input_size
-        self.device = device
+        self.device = torch.device(device)
         self.num_classes = num_classes
-
-        import torch.nn as nn
-        import torch.optim as optim
-        loss_fn = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(self.model.parameters(), lr=0.01)
-
-        self.art_classifier = PyTorchClassifier(
-            model=self.model,
-            loss=loss_fn,
-            optimizer=optimizer,
-            input_shape=(3, *input_size),
-            nb_classes=num_classes,
-            clip_values=(0.0, 1.0),
-            device_type='gpu' if 'cuda' in str(device) else 'cpu',
-        )
-
+        self.art_classifier = None
         self.methods = {
-            'advpatch': self.advpatch,
-            'lavan': self.lavan,
-            'lavan_eva': self.lavan_eva,
-
-            'art_advpatch': self.art_advpatch,
-            'art_advpatch_eva': self.art_advpatch_eva,
+            "advpatch": self.advpatch,
+            "advpatch_eva": self.advpatch_eva,
+            "lavan": self.lavan,
+            "lavan_eva": self.lavan_eva,
+            "art_advpatch": self.art_advpatch,
+            "art_advpatch_eva": self.art_advpatch_eva,
         }
-        
         self.result_manager = ResultManager.get_instance()
+
+    @staticmethod
+    def _resolve_patch_coords(x, patch_coords=None, coords=None):
+        if coords is not None and patch_coords is not None:
+            raise ValueError("Pass only one of patch_coords and shared coords")
+        batch_size, _, height, width = x.shape
+        if coords is None:
+            if patch_coords is None:
+                # Legacy robustness scripts use a fixed centre location. The
+                # controlled-comparison runner always supplies Stage-2 coords.
+                patch_coords = {
+                    "x_min": width // 2 - 32, "x_max": width // 2 + 32,
+                    "y_min": height // 2 - 32, "y_max": height // 2 + 32,
+                }
+            resolved = [patch_coords] * batch_size
+        else:
+            if len(coords) != batch_size:
+                raise ValueError("Shared coords must contain one list per sample")
+            resolved = []
+            for sample_coords in coords:
+                if len(sample_coords) != 1:
+                    raise ValueError("Patch baselines require exactly one shared box per sample")
+                x1, y1, x2, y2 = (int(value) for value in sample_coords[0])
+                resolved.append({"x_min": x1, "y_min": y1, "x_max": x2, "y_max": y2})
+        for box in resolved:
+            if not (0 <= box["x_min"] < box["x_max"] <= width and
+                    0 <= box["y_min"] < box["y_max"] <= height):
+                raise ValueError(f"Shared patch box is outside the image: {box}")
+        return resolved
+
+    @staticmethod
+    def _mask_from_coords(x, resolved):
+        mask = torch.zeros_like(x)
+        for index, box in enumerate(resolved):
+            mask[index, :, box["y_min"]:box["y_max"], box["x_min"]:box["x_max"]] = 1.0
+        return mask
+
+    @staticmethod
+    def _labels(values, batch_size, device):
+        labels = torch.as_tensor(values, dtype=torch.long, device=device).reshape(-1)
+        if labels.numel() == 1 and batch_size > 1:
+            labels = labels.expand(batch_size)
+        if labels.numel() != batch_size:
+            raise ValueError(f"Expected {batch_size} labels, got {labels.numel()}")
+        return labels
+
+    @staticmethod
+    def _loss(logits, labels, targeted):
+        ce = F.cross_entropy(logits, labels)
+        return ce if targeted else -ce
+
+    def _initial_patch(self, x, mask, patch_path=None, resolved=None):
+        patch = torch.rand_like(x) * mask
+        if patch_path is not None:
+            if len(resolved) != 1:
+                raise ValueError("patch_path initialisation is supported for one image at a time")
+            box = resolved[0]
+            width = box["x_max"] - box["x_min"]
+            height = box["y_max"] - box["y_min"]
+            image = Image.open(patch_path).convert("RGB").resize((width, height), Image.Resampling.BILINEAR)
+            patch = torch.zeros_like(x)
+            patch[0, :, box["y_min"]:box["y_max"], box["x_min"]:box["x_max"]] = T.ToTensor()(image).to(x.device)
+        return patch.clamp(0, 1)
+
+    @staticmethod
+    def _project(patch, initial, mask, eps):
+        if eps is not None:
+            patch = initial + (patch - initial).clamp(-float(eps), float(eps))
+        return (patch * mask).clamp(0, 1)
 
     def run(self, method, x, y=None, target=None, **kwargs):
         method = method.lower()
         if method not in self.methods:
-            raise ValueError(f"不支持的Patch攻击方法: {method}")
+            raise ValueError(f"Unsupported patch attack: {method}")
         return self.methods[method](x, y, target=target, **kwargs)
 
-    def advpatch(self, x, y=None, target=None, patch_path=None, alpha=0.2, **kwargs):
-        if patch_path is None:
-            raise ValueError("请提供 patch_path")
-        patch = Image.open(patch_path).convert("RGB")
-        patch = T.Resize((self.input_size[0]//4, self.input_size[1]//4))(patch)
-        patch = T.ToTensor()(patch).unsqueeze(0).to(self.device)
-        x_adv = x.clone()
-        x_adv[:, :, :patch.shape[2], :patch.shape[3]] = \
-            (1 - alpha) * x[:, :, :patch.shape[2], :patch.shape[3]] + alpha * patch
-        return x_adv
+    def _lavan(self, x, y, target, patch_coords, coords, epsilon, iterations, eps,
+               return_step_preds=False, **_kwargs):
+        resolved = self._resolve_patch_coords(x, patch_coords=patch_coords, coords=coords)
+        mask = self._mask_from_coords(x, resolved)
+        patch = self._initial_patch(x, mask)
+        initial = patch.clone()
+        targeted = target is not None
+        labels = self._labels(target if targeted else y, x.shape[0], x.device)
+        step_preds = []
+        for _ in range(int(iterations)):
+            x_adv = (x * (1 - mask) + patch * mask).detach().requires_grad_(True)
+            loss = self._loss(self.model(x_adv), labels, targeted)
+            gradient = torch.autograd.grad(loss, x_adv)[0] * mask
+            patch = patch - float(epsilon) * gradient
+            patch = self._project(patch, initial, mask, eps)
+            if return_step_preds:
+                with torch.no_grad():
+                    step_preds.append(self.model(x * (1 - mask) + patch * mask).argmax(dim=1).cpu())
+        x_adv = (x * (1 - mask) + patch * mask).clamp(0, 1).detach()
+        return (x_adv, step_preds) if return_step_preds else x_adv
 
-    def lavan(self, x, y=None, target=None, patch_coords=None, epsilon=0.01, iterations=300, **kwargs):
-        device = self.device
-        model = self.model
-        model.eval()
+    def lavan(self, x, y=None, target=None, patch_coords=None, coords=None,
+              epsilon=0.01, iterations=100, eps=16 / 255, **kwargs):
+        return self._lavan(x, y, target, patch_coords, coords, epsilon, iterations, eps, **kwargs)
 
-        b, c, h, w = x.shape
-        if patch_coords is None:
-            patch_coords = {
-                'x_min': w // 2 - 25,
-                'x_max': w // 2 + 25,
-                'y_min': h // 2 - 25,
-                'y_max': h // 2 + 25,
-            }
+    def lavan_eva(self, x, y=None, target=None, patch_coords=None, coords=None,
+                  epsilon=0.01, iterations=100, eps=16 / 255, **kwargs):
+        return self._lavan(x, y, target, patch_coords, coords, epsilon, iterations, eps,
+                           return_step_preds=True, **kwargs)
 
-        x_min, x_max = patch_coords['x_min'], patch_coords['x_max']
-        y_min, y_max = patch_coords['y_min'], patch_coords['y_max']
-
-        patch = torch.zeros_like(x).to(device)
-        mask = torch.zeros_like(x).to(device)
-        mask[:, :, y_min:y_max, x_min:x_max] = 1.0
-        patch[:, :, y_min:y_max, x_min:x_max] = torch.rand_like(patch[:, :, y_min:y_max, x_min:x_max])
-
-        x_adv = x.clone()
-
-        # 转换标签
-        if isinstance(y, int):
-            y = torch.tensor([y], dtype=torch.long, device=device)
-        elif isinstance(y, torch.Tensor):
-            y = y.to(device)
-
-        if target is not None:
-            target_tensor = target if isinstance(target, torch.Tensor) else torch.tensor([target], dtype=torch.long, device=device)
-        else:
-            target_tensor = None
-
-        for _ in range(iterations):
-            x_adv = Variable(x_adv.data, requires_grad=True)
-            outputs = model(x_adv)
-
-            if target_tensor is not None:
-                loss = -F.cross_entropy(outputs, target_tensor)
-            else:
-                loss = F.cross_entropy(outputs, y)
-
-            loss.backward()
-
-            grad = x_adv.grad.data
-            patch_grad = grad * mask
-
-            patch = patch - epsilon * patch_grad
-            patch = torch.clamp(patch, 0.0, 1.0)
+    def _advpatch(self, x, y, target, patch_path, patch_coords, coords, step_size,
+                  iterations, eps, return_step_preds=False, **_kwargs):
+        resolved = self._resolve_patch_coords(x, patch_coords=patch_coords, coords=coords)
+        mask = self._mask_from_coords(x, resolved)
+        initial = self._initial_patch(x, mask, patch_path=patch_path, resolved=resolved)
+        patch = initial.clone().requires_grad_(True)
+        optimiser = torch.optim.Adam([patch], lr=float(step_size))
+        targeted = target is not None
+        labels = self._labels(target if targeted else y, x.shape[0], x.device)
+        step_preds = []
+        for _ in range(int(iterations)):
             x_adv = x * (1 - mask) + patch * mask
-            x_adv = torch.clamp(x_adv, 0.0, 1.0)
-
-        return x_adv
-
-    def lavan_eva(self, x, y=None, target=None, patch_coords=None, epsilon=0.01, iterations=300, **kwargs):
-        #self.result_manager.log(f"lavan_eva")
-        device = self.device
-        model = self.model
-        model.eval()
-        #self.result_manager.log(f"222")
-        b, c, h, w = x.shape
-        if patch_coords is None:
-            patch_coords = {
-                'x_min': w // 2 - 25,
-                'x_max': w // 2 + 25,
-                'y_min': h // 2 - 25,
-                'y_max': h // 2 + 25,
-            }
-        #self.result_manager.log(f"444")
-        x_min, x_max = patch_coords['x_min'], patch_coords['x_max']
-        y_min, y_max = patch_coords['y_min'], patch_coords['y_max']
-        #self.result_manager.log(f"333")
-        patch = torch.zeros_like(x).to(device)
-        mask = torch.zeros_like(x).to(device)
-        mask[:, :, y_min:y_max, x_min:x_max] = 1.0
-        patch[:, :, y_min:y_max, x_min:x_max] = torch.rand_like(patch[:, :, y_min:y_max, x_min:x_max])
-        #self.result_manager.log(f"555")
-        x_adv = x.clone()
-        #self.result_manager.log(f"666")
-        # 转换标签
-        if isinstance(y, int):
-            y = torch.tensor([y], dtype=torch.long, device=device)
-        elif isinstance(y, torch.Tensor):
-            y = y.to(device)
-        #self.result_manager.log(f"777")
-        if target is not None:
-            target_tensor = target if isinstance(target, torch.Tensor) else torch.tensor([target], dtype=torch.long, device=device)
-        else:
-            target_tensor = None
-        #self.result_manager.log(f"888")
-        step_preds_list = []
-        #self.result_manager.log(f"999")
-        for _ in range(iterations):
-            if x_adv is not None:
-                x_adv = Variable(x_adv.data, requires_grad=True)
-            outputs = model(x_adv)
-            #self.result_manager.log(f"1000")
-            # 记录每步预测
+            loss = self._loss(self.model(x_adv), labels, targeted)
+            optimiser.zero_grad(set_to_none=True)
+            loss.backward()
             with torch.no_grad():
-                preds = torch.argmax(outputs, dim=1)
-                step_preds_list.append(preds.detach().cpu())
-            #self.result_manager.log(f"1111")
-            loss = None
-            if target_tensor is not None:
-                loss = -F.cross_entropy(outputs, target_tensor)
-            elif y is not None:
-                loss = F.cross_entropy(outputs, y)
-            #self.result_manager.log(f"1222")
-            if loss is not None:
-                loss.backward()
-                grad = x_adv.grad.data
-                patch_grad = grad * mask
+                patch.grad *= mask
+                optimiser.step()
+                projected = self._project(patch, initial, mask, eps)
+                patch.copy_(projected)
+                if return_step_preds:
+                    step_preds.append(self.model(x * (1 - mask) + patch * mask).argmax(dim=1).cpu())
+        x_adv = (x * (1 - mask) + patch * mask).clamp(0, 1).detach()
+        return (x_adv, step_preds) if return_step_preds else x_adv
 
-                patch = patch - epsilon * patch_grad
-                patch = torch.clamp(patch, 0.0, 1.0)
-                x_adv = x * (1 - mask) + patch * mask
-                x_adv = torch.clamp(x_adv, 0.0, 1.0)
+    def advpatch(self, x, y=None, target=None, patch_path=None, patch_coords=None, coords=None,
+                 step_size=0.01, iterations=100, eps=16 / 255, **kwargs):
+        return self._advpatch(x, y, target, patch_path, patch_coords, coords,
+                              step_size, iterations, eps, **kwargs)
 
-        return x_adv, step_preds_list
+    def advpatch_eva(self, x, y=None, target=None, patch_path=None, patch_coords=None, coords=None,
+                     step_size=0.01, iterations=100, eps=16 / 255, **kwargs):
+        return self._advpatch(x, y, target, patch_path, patch_coords, coords,
+                              step_size, iterations, eps, return_step_preds=True, **kwargs)
 
-    
+    def _get_art_classifier(self):
+        if self.art_classifier is None:
+            from art.estimators.classification import PyTorchClassifier
+            self.art_classifier = PyTorchClassifier(
+                model=self.model,
+                loss=torch.nn.CrossEntropyLoss(),
+                optimizer=torch.optim.Adam(self.model.parameters(), lr=0.01),
+                input_shape=(3, *self.input_shape) if hasattr(self, "input_shape") else (3, *self.input_size),
+                nb_classes=self.num_classes,
+                clip_values=(0.0, 1.0),
+                device_type="gpu" if self.device.type == "cuda" else "cpu",
+            )
+        return self.art_classifier
 
-    def art_advpatch(self, x, y, target=None, patch_shape=None, scale=0.3, max_iter=500, **kwargs):
+    def _apply_art_patch(self, x_np, patch, coords):
+        resolved = self._resolve_patch_coords(torch.from_numpy(x_np), coords=coords)
+        patch_np = np.asarray(patch)
+        if patch_np.ndim != 3:
+            raise ValueError("ART patch must have three dimensions")
+        if patch_np.shape[0] == 3:
+            patch_np = patch_np.transpose(1, 2, 0)
+        patch_image = Image.fromarray(np.rint(np.clip(patch_np, 0, 1) * 255).astype(np.uint8), mode="RGB")
+        result = x_np.copy()
+        for index, box in enumerate(resolved):
+            width = box["x_max"] - box["x_min"]
+            height = box["y_max"] - box["y_min"]
+            resized = patch_image.resize((width, height), Image.Resampling.BILINEAR)
+            result[index, :, box["y_min"]:box["y_max"], box["x_min"]:box["x_max"]] = (
+                np.asarray(resized, dtype=np.float32).transpose(2, 0, 1) / 255.0
+            )
+        return result
+
+    def _art_advpatch(self, x, y, target, patch_shape, coords, scale, max_iter, eva):
+        from art.attacks.evasion import AdversarialPatch
         x_np = x.detach().cpu().numpy()
-        if x_np.max() > 1:
-            x_np = x_np / 255.0
-
-        # 如果传入 target，则进行目标攻击
-        is_targeted = target is not None
-        label_tensor = target if is_targeted else y
-        y_np = label_tensor.detach().cpu().numpy() if isinstance(label_tensor, torch.Tensor) else np.array([label_tensor])
-
+        targeted = target is not None
+        labels = self._labels(target if targeted else y, x.shape[0], x.device)
         attack = AdversarialPatch(
-            classifier=self.art_classifier,
-            rotation_max=22.5,
-            scale_min=scale / 2,
-            scale_max=scale,
-            learning_rate=5.0,
-            max_iter=max_iter,
-            batch_size=x_np.shape[0],
-            patch_shape=patch_shape,
-            targeted=is_targeted,
-            verbose=False,
+            classifier=self._get_art_classifier(), rotation_max=22.5,
+            scale_min=scale / 2, scale_max=scale, learning_rate=5.0,
+            max_iter=max_iter, batch_size=x_np.shape[0], patch_shape=patch_shape,
+            targeted=targeted, verbose=False,
         )
-
-        patch, _ = attack.generate(x=x_np, y=y_np)
-        x_adv_np = attack.apply_patch(x_np, scale=scale, patch_external=patch)
-        x_adv = torch.tensor(x_adv_np).to(self.device).float()
-        assert x_adv.shape == x.shape, f"输出形状不一致: x_adv {x_adv.shape}, x {x.shape}"
-        return x_adv
-
-    def art_advpatch_eva(self, x, y, target=None, patch_shape= (64, 64, 3), scale=0.3, max_iter=500, **kwargs):
-        x_np = x.detach().cpu().numpy()
-        if x_np.max() > 1:
-            x_np = x_np / 255.0
-
-        # 如果传入 target，则进行目标攻击
-        is_targeted = target is not None
-        label_tensor = target if is_targeted else y
-        y_np = label_tensor.detach().cpu().numpy() if isinstance(label_tensor, torch.Tensor) else np.array([label_tensor])
-        #self.result_manager.log(f"11111")
-        #self.result_manager.log(f"x_np: {x_np.shape}")
-        attack = AdversarialPatch(
-            classifier=self.art_classifier,
-            rotation_max=22.5,
-            scale_min=scale / 2,
-            scale_max=scale,
-            learning_rate=5.0,
-            max_iter=max_iter,
-            batch_size=len(x_np),
-            patch_shape=patch_shape,
-            targeted=is_targeted,
-            verbose=False,
-        )
-        #self.result_manager.log(f"22222")
-        patch, _ = attack.generate(x=x_np, y=y_np)
-        x_adv_np = attack.apply_patch(x_np, scale=scale, patch_external=patch)
-        x_adv = torch.tensor(x_adv_np).to(self.device).float()
-        assert x_adv.shape == x.shape, f"输出形状不一致: x_adv {x_adv.shape}, x {x.shape}"
-        #self.result_manager.log(f"33333")
-        # 评估每步预测（这里只能评估原图和最终对抗图）
-        step_preds_list = []
+        patch, _ = attack.generate(x=x_np, y=labels.cpu().numpy())
+        x_adv_np = (self._apply_art_patch(x_np, patch, coords) if coords is not None
+                    else attack.apply_patch(x_np, scale=scale, patch_external=patch))
+        x_adv = torch.as_tensor(x_adv_np, device=self.device).float()
+        if not eva:
+            return x_adv
         with torch.no_grad():
-            preds_orig = torch.argmax(self.model(x), dim=1)
-            preds_adv = torch.argmax(self.model(x_adv), dim=1)
-            step_preds_list.append(preds_orig.detach().cpu())
-            step_preds_list.append(preds_adv.detach().cpu())
-        #self.result_manager.log(f"44444")
-        return x_adv, step_preds_list
+            return x_adv, [self.model(x).argmax(dim=1).cpu(), self.model(x_adv).argmax(dim=1).cpu()]
 
+    def art_advpatch(self, x, y, target=None, patch_shape=(3, 64, 64), coords=None,
+                     scale=0.3, max_iter=500, **_kwargs):
+        return self._art_advpatch(x, y, target, patch_shape, coords, scale, max_iter, eva=False)
+
+    def art_advpatch_eva(self, x, y, target=None, patch_shape=(3, 64, 64), coords=None,
+                         scale=0.3, max_iter=500, **_kwargs):
+        return self._art_advpatch(x, y, target, patch_shape, coords, scale, max_iter, eva=True)

@@ -38,7 +38,6 @@ if str(PROJECT_ROOT) not in sys.path:
 from configs.experiment_configs import get_config, get_target_class
 from data.dataset import get_dataloader
 from models.my_patch_attack import MyPatchAttack_Eva
-from models.patch_optimizer_changeloss import PatchOptimizer_ChangeLoss
 from utils.perceptual_evaluator import PerceptualEvaluator
 from utils.result_saver import ResultManager
 
@@ -137,81 +136,11 @@ class MyPatchAttackWithChangeLoss(MyPatchAttack_Eva):
         )
 
     def _init_modules(self):
-        """重写模块初始化，使用 PatchOptimizer_ChangeLoss"""
-        from models.Mask2Former.mask2former import SemanticSegmentor
-        from models.StableFusion.patch_generator import PatchGenerator
-        from utils.color_extractor import ColorExtractor
-        from utils.patch_blender import PatchBlender
-
-        self.segmentor = SemanticSegmentor()
-        self.patch_gen = PatchGenerator(device=self.device)
-        self.color_extractor = ColorExtractor()
-        self.patch_blender = PatchBlender(blend_width=self.config["blend_width"])
-        
-        # 使用 PatchOptimizer_ChangeLoss 替代标准优化器
-        self.optimizer = PatchOptimizer_ChangeLoss(
-            device=self.device,
-            steps=self.config["steps"],
-            eps=self.config["eps"],
-            alpha=self.config["alpha"],
-            model=self.model,
-            lambda_adv=self.lambda_adv,
-            lambda_smooth=self.lambda_smooth,
-            lambda_color=self.lambda_color,
-        )
-        
-        from utils.cam_generator import CAMGenerator
-        self.cam_gen = CAMGenerator(
-            model_name=self.config["cam_model_name"], 
-            device=str(self.device)
-        )
-
-    def _optimize(self, x, patched_x, coords, y_or_target):
-        """重写优化方法，使用 PatchOptimizer_ChangeLoss 的 optimize_batch"""
-        targeted = self.config["targeted_attack"]
-        if self.debug:
-            self._log(
-                f"Optimizing adversarial images with coordinates: {coords} and target: {y_or_target}"
-            )
-        
-        # 获取目标颜色（如果启用颜色匹配）
-        target_colors = None
-        if self.config.get("use_color_info", True):
-            try:
-                pil_imgs = self._to_pil(x)
-                color_names = self._extract_colors(pil_imgs)
-                # 将颜色名称转换为RGB值（简化处理）
-                # 这里可以根据实际需求实现更复杂的颜色提取逻辑
-                target_colors = None  # 暂时设为None，后续可以扩展
-            except:
-                target_colors = None
-        
-        # 使用 PatchOptimizer_ChangeLoss 的 optimize_batch 方法
-        result = self.optimizer.optimize_batch(
-            x, 
-            patched_x, 
-            coords, 
-            y_or_target, 
-            target_colors=target_colors,
-            targeted=targeted, 
-            return_step_preds=True
-        )
-        
-        if isinstance(result, tuple):
-            x_adv, step_preds_list = result
-        else:
-            x_adv = result
-            step_preds_list = []
-            
-        if self.debug:
-            self._log(f"Optimized adversarial images with targeted={targeted}.")
-        if self.save_imgs:
-            self._save_img(
-                self.optimizer.visualize_adversarial_comparison, 
-                x=x, 
-                x_adv=x_adv
-            )
-        return x_adv, step_preds_list
+        """Reuse the unified joint-loss pipeline and the target model for CAM."""
+        self.config["lambda_adv"] = self.lambda_adv
+        self.config["lambda_smooth"] = self.lambda_smooth
+        self.config["lambda_color"] = self.lambda_color
+        super()._init_modules({})
 
 
 # ---------------------------------------------------------------------------

@@ -38,7 +38,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from configs.experiment_configs import get_config, get_target_class
 from models.my_patch_attack import MyPatchAttack_Eva
-from models.patch_optimizer_changeloss import PatchOptimizer_ChangeLoss
 from torchvision import models
 from torchvision.models import ResNet50_Weights
 from utils.result_saver import ResultManager
@@ -359,96 +358,12 @@ class AlgorithmVisualizationGenerator:
         patched_img = attack._blend_patches(img_tensor, patch_tensor_torch, coords_list)
         self.save_image(patched_img, "blended_image.png", "blended")
 
-        # 优化过程
+        # 使用统一优化器，避免示意图脚本复制另一套损失/投影逻辑。
         print("\n[步骤9] 执行对抗优化...")
-        # 使用PatchOptimizer_ChangeLoss进行优化
-        optimizer = PatchOptimizer_ChangeLoss(
-            device=self.device,
-            steps=self.config["steps"],
-            eps=self.config["eps"],
-            alpha=self.config["alpha"],
-            model=self.model,
-            lambda_adv=self.config.get("lambda_adv", 1.0),
-            lambda_smooth=self.config.get("lambda_smooth", 0.1),
-            lambda_color=self.config.get("lambda_color", 0.05),
-        )
-
-        # 保存优化过程中的关键步骤
-        optimization_steps = [0, self.config["steps"] // 4, self.config["steps"] // 2, self.config["steps"] - 1]
-        saved_steps = []
-
-        # 手动执行优化步骤以保存中间结果（使用完整的损失函数）
-        B, _, H, W = img_tensor.shape
-        x_adv = patched_img.clone().detach().to(self.device)
-        ori = img_tensor.clone().detach().to(self.device)
         label_opt = target_tensor if (self.config.get("targeted_attack", False) and target_tensor is not None) else label_tensor
-
-        # 生成patch mask和regions
-        patch_mask = torch.zeros((B, 1, H, W), dtype=torch.float32, device=self.device)
-        patch_regions = []
-        for i, coords in enumerate(coords_list):
-            patch_regions.append([])
-            for (x1, y1, x2, y2) in coords:
-                patch_mask[i, 0, y1:y2, x1:x2] = 1.0
-                patch_regions[i].append((x1, y1, x2, y2))
-
-        momentum = torch.zeros_like(x_adv).to(self.device)
-
-        # 保存初始状态
-        saved_steps.append((0, x_adv.clone()))
-
-        for step in range(1, self.config["steps"]):
-            x_adv.requires_grad = True
-            outputs = self.model(x_adv)
-
-            # 计算对抗损失
-            adv_loss = torch.nn.functional.cross_entropy(outputs, label_opt)
-            if self.config.get("targeted_attack", False):
-                adv_loss = -adv_loss
-
-            # 提取当前patch区域用于计算辅助损失
-            current_patches = []
-            for i, regions in enumerate(patch_regions):
-                for (x1, y1, x2, y2) in regions:
-                    patch = x_adv[i, :, y1:y2, x1:x2]
-                    current_patches.append(patch)
-
-            # 计算总损失（包含平滑损失和颜色损失）
-            if current_patches:
-                combined_patches = torch.cat(current_patches, dim=0)
-                # 确保combined_patches是4维张量[B, 3, H, W]格式
-                if combined_patches.dim() == 3:
-                    # 假设形状是[3*N, H, W]，需要重新调整为[N, 3, H, W]
-                    num_patches = combined_patches.shape[0] // 3
-                    combined_patches = combined_patches.view(num_patches, 3, combined_patches.shape[1], combined_patches.shape[2])
-                smooth_loss = optimizer._total_variation_loss(combined_patches)
-                color_loss = 0  # 暂时不使用颜色损失，因为需要target_colors
-                total_loss = (
-                    optimizer.lambda_adv * adv_loss
-                    + optimizer.lambda_smooth * smooth_loss
-                    + optimizer.lambda_color * color_loss
-                )
-            else:
-                total_loss = adv_loss
-
-            # 反向传播
-            grad = torch.autograd.grad(total_loss, x_adv, retain_graph=False, create_graph=False)[0]
-            grad_norm = grad / (grad.abs().mean(dim=[1, 2, 3], keepdim=True) + 1e-8)
-            momentum = optimizer.decay * momentum + grad_norm
-
-            x_adv = x_adv.detach() + optimizer.alpha * momentum.sign() * patch_mask
-            x_adv = torch.max(torch.min(x_adv, ori + optimizer.eps), ori - optimizer.eps)
-            x_adv = torch.clamp(x_adv, 0, 1)
-
-            # 保存关键步骤
-            if step in optimization_steps:
-                saved_steps.append((step, x_adv.clone()))
-
-        # 保存优化过程中的关键步骤
-        for step, step_img in saved_steps:
-            self.save_image(
-                step_img, f"optimization_step_{step}.png", "optimization"
-            )
+        x_adv, _step_preds = attack._optimize(img_tensor, patched_img, coords_list, label_opt)
+        for step, step_img in [(0, patched_img), (self.config["steps"], x_adv)]:
+            self.save_image(step_img, f"optimization_step_{step}.png", "optimization")
 
         # 最终对抗样本
         print("\n[步骤10] 保存最终对抗样本...")

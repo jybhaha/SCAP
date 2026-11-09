@@ -10,7 +10,6 @@
 
 import torch
 import torch.nn as nn
-import torchvision.models as models
 import json
 import numpy as np
 import time
@@ -33,38 +32,14 @@ class TransferabilityEvaluator:
         self._init_attackers()
         
     def _init_models(self):
-        """初始化各种目标模型 - 选择代表性模型"""
-        self.rm.log("Initializing target models for transferability evaluation...")
-        
-        # 选择代表性的模型，减少数量但保持多样性
+        """Build all nine paper models through the shared registry."""
+        from models.model_registry import MODEL_NAMES, build_model
+        self.rm.log("Initializing nine target models for transferability evaluation...")
         self.all_models = {
-            # 传统CNN
-            "resnet50": models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V1),
-            "vgg16": models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1),
-            "densenet121": models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1),
-            "inception_v3": models.inception_v3(weights=models.Inception_V3_Weights.IMAGENET1K_V1),
-            
-            # 现代CNN
-            "efficientnet_b0": models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1),
-            "mobilenet_v3": models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.IMAGENET1K_V1),
-            "convnext_tiny": models.convnext_tiny(weights=models.ConvNeXt_Tiny_Weights.IMAGENET1K_V1),
-            
-            # Transformer架构
-            "vit_b_16": models.vit_b_16(weights=models.ViT_B_16_Weights.IMAGENET1K_V1),
-            "swin_t": models.swin_t(weights=models.Swin_T_Weights.IMAGENET1K_V1),
+            name: build_model(name, weights="IMAGENET1K_V1", device=self.device)
+            for name in MODEL_NAMES
         }
-        
-        # 将所有模型移动到设备并设置为评估模式
-        for name, model in self.all_models.items():
-            try:
-                model.to(self.device)
-                model.eval()
-                self.rm.log(f"Successfully initialized {name}")
-            except Exception as e:
-                self.rm.log(f"Failed to initialize {name}: {e}")
-                del self.all_models[name]
-        
-        self.rm.log(f"Successfully initialized {len(self.all_models)} representative models")
+        self.rm.log(f"Successfully initialized {len(self.all_models)} models")
         
     def _init_attackers(self):
         """初始化攻击器"""
@@ -119,12 +94,10 @@ class TransferabilityEvaluator:
             self.rm.log(f"Testing attacks from source model: {source_name}")
             results["cross_model_detailed"][source_name] = {}
             
-            # 为当前源模型重新初始化攻击器
-            try:
-                source_attacker = MyPatchAttack(model=source_model, device=self.device)
-            except Exception as e:
-                self.rm.log(f"Failed to initialize attacker for {source_name}: {e}")
-                continue
+            # CAM target layer must follow the actual source architecture.
+            attack_config = deepcopy(config)
+            attack_config["cam_model_name"] = source_name
+            source_attacker = MyPatchAttack(model=source_model, device=self.device, config=attack_config)
             
             # 测试所有目标模型
             for target_name, target_model in self.all_models.items():
@@ -167,7 +140,7 @@ class TransferabilityEvaluator:
     def _get_model_family(self, model_name):
         """根据模型名称判断所属家族"""
         traditional_cnn = ["resnet50", "vgg16", "densenet121", "inception_v3"]
-        modern_cnn = ["efficientnet_b0", "mobilenet_v3", "convnext_tiny"]
+        modern_cnn = ["efficientnet_b0", "mobilenet_v3_large", "convnext_tiny"]
         transformer = ["vit_b_16", "swin_t"]
         
         if model_name in traditional_cnn:
@@ -244,7 +217,7 @@ class TransferabilityEvaluator:
         # 定义模型家族
         families = {
             "Traditional_CNN": ["resnet50", "vgg16", "densenet121", "inception_v3"],
-            "Modern_CNN": ["efficientnet_b0", "mobilenet_v3", "convnext_tiny"],
+            "Modern_CNN": ["efficientnet_b0", "mobilenet_v3_large", "convnext_tiny"],
             "Transformer": ["vit_b_16", "swin_t"]
         }
         
@@ -271,11 +244,9 @@ class TransferabilityEvaluator:
             if source_model is None:
                 continue
                 
-            try:
-                source_attacker = MyPatchAttack(model=source_model, device=self.device)
-            except Exception as e:
-                self.rm.log(f"Failed to create attacker for {source_family}: {e}")
-                continue
+            attack_config = deepcopy(config)
+            attack_config["cam_model_name"] = source_model_name
+            source_attacker = MyPatchAttack(model=source_model, device=self.device, config=attack_config)
             
             for target_family, target_model_names in families.items():
                 target_asr, target_success, target_total = self._test_family_attack(

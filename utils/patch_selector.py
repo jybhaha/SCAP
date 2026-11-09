@@ -1,330 +1,238 @@
-import cv2
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.ndimage import distance_transform_edt
-import cv2
-import numpy as np
-import torch
+"""Deterministic scene-aware patch placement with progressive relaxation."""
 
+from __future__ import annotations
 
+import copy
 import os
-import matplotlib.pyplot as plt
-from torchvision.transforms.functional import to_pil_image
-from PIL import ImageDraw, Image
 from typing import List
-from utils.result_saver import ResultManager
 
-def distance_transform_numpy(mask_tensor: torch.Tensor):
-    """
-    将二值 tensor mask 转为 numpy 后进行距离变换
-    输入: mask_tensor: torch.Tensor (H, W) 0/1
-    输出: torch.Tensor (H, W), float32
-    """
-    mask_np = mask_tensor.cpu().numpy().astype(np.uint8)
-    dist_np = cv2.distanceTransform(1 - mask_np, cv2.DIST_L2, 5)
-    dist_tensor = torch.from_numpy(dist_np)
-    return dist_tensor
-
-
-class PatchSelector:
-    def __init__(self, binary_mask, rgb_image, patch_size=(64, 64), cam_mask=None):
-        self.binary_mask = binary_mask.astype(np.uint8)
-        self.cam_mask = cam_mask.astype(np.uint8) if cam_mask is not None else np.zeros_like(self.binary_mask)
-        self.rgb_image = np.array(rgb_image)
-        self.patch_size = patch_size
-        self.H, self.W = binary_mask.shape
-
-        self.dist_to_cam = distance_transform_edt(1 - self.cam_mask)
-        self.rm = ResultManager.get_instance()
-
-    def _score_patch(self, x, y):
-        ph, pw = self.patch_size
-        if y + ph > self.H or x + pw > self.W:
-            return None
-
-        cam_area = self.cam_mask[y:y+ph, x:x+pw]
-        if cam_area.sum() > 0.1 * ph * pw:
-            return None
-
-        mask_area = self.binary_mask[y:y+ph, x:x+pw]
-        if mask_area.sum() < 0.5 * ph * pw:
-            return None
-
-        dist_patch = self.dist_to_cam[y:y+ph, x:x+pw]
-        dist_score = np.mean(dist_patch)
-        return dist_score
-
-    def _is_overlap(self, box1, box2, iou_thresh=0.2):
-        x1, y1, x2, y2 = box1
-        x1_p, y1_p, x2_p, y2_p = box2
-
-        inter_x1 = max(x1, x1_p)
-        inter_y1 = max(y1, y1_p)
-        inter_x2 = min(x2, x2_p)
-        inter_y2 = min(y2, y2_p)
-
-        inter_w = max(0, inter_x2 - inter_x1)
-        inter_h = max(0, inter_y2 - inter_y1)
-        inter_area = inter_w * inter_h
-
-        area1 = (x2 - x1) * (y2 - y1)
-        area2 = (x2_p - x1_p) * (y2_p - y1_p)
-        iou = inter_area / float(area1 + area2 - inter_area + 1e-6)
-
-        return iou > iou_thresh
-
-    def find_top_k_candidates(self, k=3, stride_ratio=0.5):
-        ph, pw = self.patch_size
-        stride_h, stride_w = int(ph * stride_ratio), int(pw * stride_ratio)
-
-        candidates = []
-        for y in range(0, self.H - ph + 1, stride_h):
-            for x in range(0, self.W - pw + 1, stride_w):
-                score = self._score_patch(x, y)
-                if score is not None:
-                    box = (x, y, x + pw, y + ph)
-                    candidates.append((box, score))
-
-        if not candidates:
-            raise ValueError("❌ 无法找到满足条件的patch位置")
-
-        # 按照得分排序（越小表示越靠近CAM）
-        candidates.sort(key=lambda x: x[1])
-
-        selected = []
-        for box, score in candidates:
-            if len(selected) >= k:
-                break
-            if not any(self._is_overlap(box, sel_box) for sel_box, _ in selected):
-                selected.append((box, score))
-
-        if not selected:
-            print("⚠️ 候选位置全部重叠，保留最优位置。")
-            
-            return [candidates[0]]
-
-        return selected
-
-    def visualize_top_k(self, top_k):
-        debug_img = self.rgb_image.copy()
-        for i, ((x1, y1, x2, y2), score) in enumerate(top_k):
-            color = (0, 255 - i * 40, i * 40)
-            cv2.rectangle(debug_img, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(debug_img, f"{i+1}:{score:.1f}", (x1, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-        plt.imshow(debug_img)
-        plt.title("Top-K Patch Positions (Non-overlapping)")
-        plt.axis("off")
-        plt.show()
-
-    def get_best_patch_positions(self, k=3, stride_ratio=0.5, visualize=True):
-        top_k = self.find_top_k_candidates(k=k, stride_ratio=stride_ratio)
-        if visualize:
-            self.visualize_top_k(top_k)
-        return [(x1, y1, x2, y2) for (x1, y1, x2, y2), _ in top_k]
-
-import torch
-import numpy as np
-import cv2
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from PIL import Image, ImageDraw
 from scipy.ndimage import distance_transform_edt
+from torchvision.transforms.functional import to_pil_image, to_tensor
+
+
+class UnresolvedPlacementError(ValueError):
+    """No admissible Stage-2 window remains after bounded relaxation."""
+
 
 class PatchSelectorBatch:
-    def __init__(self, binary_masks_batch, rgb_images_batch: torch.Tensor, patch_size=(64, 64), cam_masks_batch=None, device=None,cam_thresh_ratio = 0.3, mask_thresh_ratio=0.2):
-        """
-        binary_masks_batch: List[Tensor] 或 Tensor，shape=[B,H,W]，值为0/1，float或uint8
-        rgb_images_batch: Tensor，shape=[B,3,H,W]
-        cam_masks_batch: List[Tensor] 或 Tensor，shape=[B,H,W]，0/1
-        """
-        self.rm = ResultManager.get_instance()
-        self.device = device or (torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'))
-        #self.rm.log(f"PatchSelectorBatch initialized on device: {self.device}")
-        # 转换 binary_masks_batch 为 batched tensor
-        if isinstance(binary_masks_batch, list):
-            #self.rm.log(f"Converting binary_masks_batch from list to tensor with {len(binary_masks_batch)} items.")
-            binary_masks_batch = torch.stack([m.float().to(self.device) for m in binary_masks_batch], dim=0)
-            #self.rm.log(f"Converted binary_masks_batch shape: {binary_masks_batch.shape}")
-        else:
-            binary_masks_batch = binary_masks_batch.float().to(self.device)
-        self.binary_masks_batch = binary_masks_batch
-        self.cam_thresh_ratio = cam_thresh_ratio
-        self.mask_thresh_ratio = mask_thresh_ratio
-       
-        # 转换 cam_masks_batch 为 batched tensor（或创建为全 0）
+    def __init__(self, binary_masks_batch, rgb_images_batch: torch.Tensor,
+                 patch_size=(64, 64), cam_masks_batch=None, device=None,
+                 cam_thresh_ratio=0.3, mask_thresh_ratio=0.2,
+                 relaxation_steps=4, fallback_policy="best"):
+        self.device = torch.device(device) if device is not None else rgb_images_batch.device
+        self.binary_masks_batch = self._as_batch(binary_masks_batch).to(self.device)
         if cam_masks_batch is None:
             self.cam_masks_batch = torch.zeros_like(self.binary_masks_batch)
         else:
-            if isinstance(cam_masks_batch, list):
-                cam_masks_batch = torch.stack([m.float().to(self.device) for m in cam_masks_batch], dim=0)
-            else:
-                cam_masks_batch = cam_masks_batch.float().to(self.device)
-        self.cam_masks_batch = cam_masks_batch.to(self.device)
-        #self.rm.log(f"CAM masks batch shape: {self.cam_masks_batch.shape}")
-        # RGB 图像张量
+            self.cam_masks_batch = self._as_batch(cam_masks_batch).to(self.device)
         self.rgb_images_batch = rgb_images_batch.to(self.device)
-
-        self.patch_size = patch_size
-        self.ph, self.pw = patch_size
+        if self.binary_masks_batch.shape != self.cam_masks_batch.shape:
+            raise ValueError("Semantic and CAM masks must have identical [B,H,W] shapes")
+        self.patch_size = tuple(int(value) for value in patch_size)
+        self.ph, self.pw = self.patch_size
         self.B, self.H, self.W = self.binary_masks_batch.shape
-        #self.rm.log(f"Batch size: {self.B}, Image size: {self.H}x{self.W}, Patch size: {self.ph}x{self.pw}")
-        # 计算批量 distance_transform_edt
-        self.dist_to_cam_batch = []
-        for i in range(self.B):
-            cam_mask_np = (1 - self.cam_masks_batch[i].cpu().numpy()).astype(np.uint8)
-            dist_map = distance_transform_edt(cam_mask_np)
-            self.dist_to_cam_batch.append(torch.from_numpy(dist_map).to(self.device))
-        self.dist_to_cam_batch = torch.stack(self.dist_to_cam_batch, dim=0)  # [B,H,W]
-        
+        if self.ph < 1 or self.pw < 1 or self.ph > self.H or self.pw > self.W:
+            raise ValueError(f"Patch size {self.patch_size} does not fit image {(self.H, self.W)}")
+        if not 0 <= cam_thresh_ratio <= 1 or not 0 <= mask_thresh_ratio <= 1:
+            raise ValueError("cam_thresh_ratio and mask_thresh_ratio must be in [0,1]")
+        self.initial_cam_thresh = float(cam_thresh_ratio)
+        self.initial_mask_thresh = float(mask_thresh_ratio)
+        self.cam_thresh_ratio = self.initial_cam_thresh
+        self.mask_thresh_ratio = self.initial_mask_thresh
+        self.relaxation_steps = int(relaxation_steps)
+        if self.relaxation_steps < 0:
+            raise ValueError("relaxation_steps must be non-negative")
+        if fallback_policy not in ("best", "raise"):
+            raise ValueError("fallback_policy must be 'best' or 'raise'")
+        self.fallback_policy = fallback_policy
+        self.diagnostics = [self._new_diagnostics() for _ in range(self.B)]
+        self.dist_to_cam_batch = torch.stack([
+            torch.from_numpy(distance_transform_edt(1 - self.cam_masks_batch[i].cpu().numpy().astype(np.uint8)))
+            for i in range(self.B)
+        ]).to(self.device)
+
+    @staticmethod
+    def _as_batch(masks):
+        if isinstance(masks, list):
+            masks = torch.stack([torch.as_tensor(mask) for mask in masks])
+        else:
+            masks = torch.as_tensor(masks)
+        if masks.ndim == 2:
+            masks = masks.unsqueeze(0)
+        if masks.ndim != 3:
+            raise ValueError("Masks must have shape [B,H,W] or be a list of [H,W] tensors")
+        return (masks.float() > 0).float()
+
+    def _new_diagnostics(self):
+        return {
+            "fallback_triggered": False,
+            "relaxation_steps": 0,
+            "initial_cam_thresh_ratio": self.initial_cam_thresh,
+            "initial_mask_thresh_ratio": self.initial_mask_thresh,
+            "final_cam_thresh_ratio": self.initial_cam_thresh,
+            "final_mask_thresh_ratio": self.initial_mask_thresh,
+            "candidate_count": 0,
+            "deterministic_fallback": False,
+        }
 
     def _score_patch(self, b, x, y):
-        if y + self.ph > self.H or x + self.pw > self.W:
+        cam_area = self.cam_masks_batch[b, y:y + self.ph, x:x + self.pw].mean().item()
+        mask_area = self.binary_masks_batch[b, y:y + self.ph, x:x + self.pw].mean().item()
+        if cam_area > self.cam_thresh_ratio or mask_area < self.mask_thresh_ratio:
             return None
-        cam_area = self.cam_masks_batch[b, y:y+self.ph, x:x+self.pw]
-        mask_area = self.binary_masks_batch[b, y:y+self.ph, x:x+self.pw]
-        
-        #cam_thresh_ratio = 0.3     # 容忍最多 30% 落在 CAM 上
-        #mask_thresh_ratio = 0.2    # 至少 20% 落在目标区域上
+        distance = self.dist_to_cam_batch[b, y:y + self.ph, x:x + self.pw].mean().item()
+        return distance + cam_area - mask_area
 
-        if cam_area.sum() > self.cam_thresh_ratio * self.ph * self.pw:
-            return None
-        if mask_area.sum() < self.mask_thresh_ratio * self.ph * self.pw:
-            return None
-        
-
-        
-        if mask_area.sum() < 0.5 * self.ph * self.pw:
-            return None
-
-        dist_patch = self.dist_to_cam_batch[b, y:y+self.ph, x:x+self.pw]
-        dist_score = dist_patch.mean().item()
-        return dist_score
-
-    def _is_overlap(self, box1, box2, iou_thresh=0.2):
+    @staticmethod
+    def _is_overlap(box1, box2, iou_thresh=0.2):
         x1, y1, x2, y2 = box1
-        x1_p, y1_p, x2_p, y2_p = box2
+        a1, b1, a2, b2 = box2
+        intersection = max(0, min(x2, a2) - max(x1, a1)) * max(0, min(y2, b2) - max(y1, b1))
+        union = (x2 - x1) * (y2 - y1) + (a2 - a1) * (b2 - b1) - intersection
+        return intersection / max(union, 1e-12) > iou_thresh
 
-        inter_x1 = max(x1, x1_p)
-        inter_y1 = max(y1, y1_p)
-        inter_x2 = min(x2, x2_p)
-        inter_y2 = min(y2, y2_p)
+    def _grid(self, stride_ratio):
+        if not 0 < stride_ratio <= 1:
+            raise ValueError("stride_ratio must be in (0,1]")
+        stride_h = max(1, int(self.ph * stride_ratio))
+        stride_w = max(1, int(self.pw * stride_ratio))
+        ys = list(range(0, self.H - self.ph + 1, stride_h))
+        xs = list(range(0, self.W - self.pw + 1, stride_w))
+        if ys[-1] != self.H - self.ph:
+            ys.append(self.H - self.ph)
+        if xs[-1] != self.W - self.pw:
+            xs.append(self.W - self.pw)
+        return ((x, y) for y in ys for x in xs)
 
-        inter_w = max(0, inter_x2 - inter_x1)
-        inter_h = max(0, inter_y2 - inter_y1)
-        inter_area = inter_w * inter_h
-
-        area1 = (x2 - x1) * (y2 - y1)
-        area2 = (x2_p - x1_p) * (y2_p - y1_p)
-        iou = inter_area / float(area1 + area2 - inter_area + 1e-6)
-
-        return iou > iou_thresh
-
-  
-    
-    def find_top_k_candidates_single(self, b, k=3, stride_ratio=0.5):
-        stride_h, stride_w = int(self.ph * stride_ratio), int(self.pw * stride_ratio)
-        candidates = []
-        for y in range(0, self.H - self.ph + 1, stride_h):
-            for x in range(0, self.W - self.pw + 1, stride_w):
-                score = self._score_patch(b, x, y)
-                if score is not None:
-                    box = (x, y, x + self.pw, y + self.ph)
-                    candidates.append((box, score))
-
-        if not candidates:
-            #self.rm.log(f"⚠️ Batch idx {b}: 无法找到满足条件的位置，随机选用 {k} 个位置")
-
-            selected = []
-            attempts = 0
-            max_attempts = 100 * k  # 防止死循环
-            while len(selected) < k and attempts < max_attempts:
-                x = np.random.randint(0, self.W - self.pw + 1)
-                y = np.random.randint(0, self.H - self.ph + 1)
-                box = (x, y, x + self.pw, y + self.ph)
-
-                if not any(self._is_overlap(box, sel_box) for sel_box, _ in selected):
-                    selected.append((box, 0.0))
-
-                attempts += 1
-
-            if not selected:
-                # 万一随机都失败，退而求其次返回一个默认框
-                box = (0, 0, self.pw, self.ph)
-                selected = [(box, 0.0)]
-                self.rm.log(f"⚠️ Batch idx {b}: 随机位置失败，使用默认 patch {box}")
-
-            return selected
-
-        # 正常筛选
-        candidates.sort(key=lambda x: x[1])
+    def _select(self, candidates, k):
+        candidates = sorted(candidates, key=lambda item: (item[1], item[0][1], item[0][0]))
         selected = []
         for box, score in candidates:
             if len(selected) >= k:
                 break
-            if not any(self._is_overlap(box, sel_box) for sel_box, _ in selected):
+            if not any(self._is_overlap(box, chosen[0]) for chosen in selected):
                 selected.append((box, score))
-
-        if not selected:
-            selected.append(candidates[0])
-
         return selected
 
+    def _deterministic_best(self, b, k, stride_ratio):
+        """Last-resort deterministic ranking; never samples random coordinates."""
+        candidates = []
+        for x, y in self._grid(stride_ratio):
+            box = (x, y, x + self.pw, y + self.ph)
+            cam_ratio = self.cam_masks_batch[b, y:y + self.ph, x:x + self.pw].mean().item()
+            mask_ratio = self.binary_masks_batch[b, y:y + self.ph, x:x + self.pw].mean().item()
+            violation = max(0.0, cam_ratio - self.initial_cam_thresh) + max(0.0, self.initial_mask_thresh - mask_ratio)
+            candidates.append((box, violation + cam_ratio - mask_ratio))
+        selected = self._select(candidates, k)
+        if not selected:
+            raise ValueError(f"No geometrically valid patch candidate for batch index {b}")
+        return selected
 
-
+    def find_top_k_candidates_single(self, b, k=3, stride_ratio=0.5):
+        if k < 1:
+            raise ValueError("k must be positive")
+        diagnostics = self._new_diagnostics()
+        for relaxation in range(self.relaxation_steps + 1):
+            # Keep the final attempt bounded: cam=1/mask=0 would accept every
+            # window and make an unresolved placement impossible by construction.
+            fraction = relaxation / max(1, self.relaxation_steps + 1)
+            self.cam_thresh_ratio = self.initial_cam_thresh + (1.0 - self.initial_cam_thresh) * fraction
+            self.mask_thresh_ratio = self.initial_mask_thresh * (1.0 - fraction)
+            candidates = []
+            for x, y in self._grid(stride_ratio):
+                score = self._score_patch(b, x, y)
+                if score is not None:
+                    candidates.append(((x, y, x + self.pw, y + self.ph), score))
+            selected = self._select(candidates, k)
+            diagnostics.update({
+                "fallback_triggered": relaxation > 0,
+                "relaxation_steps": relaxation,
+                "final_cam_thresh_ratio": self.cam_thresh_ratio,
+                "final_mask_thresh_ratio": self.mask_thresh_ratio,
+                "candidate_count": len(candidates),
+            })
+            if selected:
+                self.diagnostics[b] = diagnostics
+                return selected
+        if self.fallback_policy == "raise":
+            self.diagnostics[b] = diagnostics
+            raise UnresolvedPlacementError(
+                f"No patch candidate after {self.relaxation_steps} relaxation steps for batch {b}"
+            )
+        selected = self._deterministic_best(b, k, stride_ratio)
+        diagnostics.update({"fallback_triggered": True, "deterministic_fallback": True})
+        self.diagnostics[b] = diagnostics
+        return selected
 
     def get_best_patch_positions(self, k=3, stride_ratio=0.5):
-        batch_results = []
-        for b in range(self.B):
-            top_k = self.find_top_k_candidates_single(b, k=k, stride_ratio=stride_ratio)
-            
-            batch_results.append([(x1, y1, x2, y2) for (x1, y1, x2, y2), _ in top_k])
-        return batch_results
+        return [
+            [box for box, _score in self.find_top_k_candidates_single(b, k=k, stride_ratio=stride_ratio)]
+            for b in range(self.B)
+        ]
 
+    def get_diagnostics(self):
+        return copy.deepcopy(self.diagnostics)
 
     def visualize_patch_selection(self, images_tensor: torch.Tensor,
-                                selected_boxes_batch: List[List[tuple]],
-                                save_dir: str = None,
-                                timestamp_str: str = "default_time",
-                                show: bool = False):
-        """
-        Visualize selected patch regions on original images (batch-wise).
-
-        Args:
-            images_tensor: Tensor of shape [B, 3, H, W]
-            selected_boxes_batch: List of List of selected patch boxes per image.
-                                Each box is (x1, y1, x2, y2)
-            save_dir: Directory to save the visualizations
-            timestamp_str: Used in output filename, e.g., "20250625T084510"
-            show: Whether to display the result using matplotlib
-        """
-        B = images_tensor.shape[0]
-        for i in range(B):
-            image = images_tensor[i]
-            if image.max() <= 1.0:
-                image = image * 255.0
-            image = image.to(torch.uint8).cpu()
-            image_pil = to_pil_image(image).convert("RGB")
-
-            draw = ImageDraw.Draw(image_pil)
-            boxes = selected_boxes_batch[i]
-            for box_idx, (x1, y1, x2, y2) in enumerate(boxes):
+                                  selected_boxes_batch: List[List[tuple]],
+                                  save_dir: str = None, timestamp_str: str = "default_time",
+                                  show: bool = False):
+        for index in range(images_tensor.shape[0]):
+            image = to_pil_image(images_tensor[index].detach().cpu()).convert("RGB")
+            draw = ImageDraw.Draw(image)
+            for box_index, (x1, y1, x2, y2) in enumerate(selected_boxes_batch[index]):
                 draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=3)
-                draw.text((x1 + 3, y1 + 3), f"P{box_idx+1}", fill=(255, 255, 0))
-
+                draw.text((x1 + 3, y1 + 3), f"P{box_index + 1}", fill=(255, 255, 0))
             if save_dir is not None:
                 os.makedirs(save_dir, exist_ok=True)
-                filename = f"patch_selection_{timestamp_str}_{i}.png"
-                save_path = os.path.join(save_dir, filename)
-
-                fig, ax = plt.subplots(figsize=(6, 6))
-                ax.imshow(image_pil)
-                ax.axis("off")
-                ax.set_title(f"Selected Patches - Sample {i}")
-                fig.savefig(save_path, dpi=300, bbox_inches='tight')
-                plt.close(fig)
-
+                image.save(os.path.join(save_dir, f"patch_selection_{timestamp_str}_{index}.png"))
             if show:
-                plt.figure(figsize=(6, 6))
-                plt.imshow(image_pil)
+                plt.imshow(image)
                 plt.axis("off")
-                plt.title(f"Selected Patches - Sample {i}")
                 plt.show()
+
+
+class PatchSelector:
+    """Single-image compatibility wrapper around :class:`PatchSelectorBatch`."""
+
+    def __init__(self, binary_mask, rgb_image, patch_size=(64, 64), cam_mask=None,
+                 cam_thresh_ratio=0.1, mask_thresh_ratio=0.5,
+                 relaxation_steps=4, fallback_policy="best"):
+        if isinstance(rgb_image, Image.Image):
+            image_tensor = to_tensor(rgb_image.convert("RGB")).unsqueeze(0)
+        else:
+            array = np.asarray(rgb_image)
+            if array.max() > 1.0:
+                array = array / 255.0
+            image_tensor = torch.from_numpy(array).float().permute(2, 0, 1).unsqueeze(0)
+        self._batch = PatchSelectorBatch(
+            [binary_mask], image_tensor, patch_size=patch_size,
+            cam_masks_batch=None if cam_mask is None else [cam_mask],
+            cam_thresh_ratio=cam_thresh_ratio, mask_thresh_ratio=mask_thresh_ratio,
+            relaxation_steps=relaxation_steps, fallback_policy=fallback_policy,
+        )
+        self.rgb_image = np.asarray(rgb_image)
+        self.patch_size = patch_size
+
+    @property
+    def diagnostics(self):
+        return self._batch.diagnostics[0]
+
+    def find_top_k_candidates(self, k=3, stride_ratio=0.5):
+        return self._batch.find_top_k_candidates_single(0, k=k, stride_ratio=stride_ratio)
+
+    def get_best_patch_positions(self, k=3, stride_ratio=0.5, visualize=False):
+        top_k = self.find_top_k_candidates(k=k, stride_ratio=stride_ratio)
+        if visualize:
+            image = Image.fromarray(self.rgb_image.astype(np.uint8)).convert("RGB")
+            draw = ImageDraw.Draw(image)
+            for (x1, y1, x2, y2), _score in top_k:
+                draw.rectangle((x1, y1, x2, y2), outline=(255, 0, 0), width=2)
+            plt.imshow(image)
+            plt.axis("off")
+            plt.show()
+        return [box for box, _score in top_k]

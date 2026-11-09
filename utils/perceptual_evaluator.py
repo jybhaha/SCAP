@@ -10,16 +10,23 @@ from typing import List
 from utils.result_saver import ResultManager
 
 class PerceptualEvaluator:
-    def __init__(self, device='cuda', lpips_net='alex'):
+    def __init__(self, device='cuda', lpips_net='alex', init_no_reference=False):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.lpips_loss = lpips.LPIPS(net=lpips_net).to(self.device)
-        # 初始化 NR-IQA 模型
-        self.nr_models = {
-            'clipiqa': pyiqa.create_metric('clipiqa', device=self.device),
-            'musiq': pyiqa.create_metric('musiq', device=self.device),
-            'niqe': pyiqa.create_metric('niqe', device=self.device)
-        }
+        # NR-IQA checkpoints are optional and lazy; reference SSIM/LPIPS runs do
+        # not initialise or download unrelated models.
+        self.nr_models = {}
+        if init_no_reference:
+            self._init_no_reference_models()
         self.rm = ResultManager.get_instance()
+
+    def _init_no_reference_models(self):
+        if not self.nr_models:
+            self.nr_models = {
+                'clipiqa': pyiqa.create_metric('clipiqa', device=self.device),
+                'musiq': pyiqa.create_metric('musiq', device=self.device),
+                'niqe': pyiqa.create_metric('niqe', device=self.device)
+            }
 
     def calc_ssim(self, x1: torch.Tensor, x2: torch.Tensor) -> float:
         ssim_list = []
@@ -77,6 +84,7 @@ class PerceptualEvaluator:
 
     def calc_no_reference_metrics(self, x: torch.Tensor) -> dict:
         results = {}
+        self._init_no_reference_models()
         x = x.clamp(0, 1).float().to(self.device)  # 保证范围和类型
         for name, model in self.nr_models.items():
             try:

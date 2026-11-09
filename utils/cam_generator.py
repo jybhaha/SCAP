@@ -1,278 +1,210 @@
+"""Grad-CAM for the nine supported torchvision classifier architectures."""
+
+from __future__ import annotations
+
+import math
+import os
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-import cv2
-from torchvision import models, transforms
 from PIL import Image
-import matplotlib.pyplot as plt
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image, ImageDraw
 from torchvision.transforms.functional import to_pil_image
+
+from models.imagenet_model import IMAGENET_MEAN, IMAGENET_STD, ImageNetClassifier
+
+
+def resolve_target_layer(model, model_name):
+    """Resolve a spatial feature layer without constructing another model."""
+    model = getattr(model, "raw_model", model)
+    name = model_name.lower()
+    if name == "resnet50":
+        return model.layer4[-1]
+    if name == "vgg16":
+        return model.features[-1]
+    if name == "densenet121":
+        return model.features[-1]
+    if name == "inception_v3":
+        return model.Mixed_7c
+    if name in ("efficientnet_b0", "mobilenet_v3_large", "convnext_tiny"):
+        return model.features[-1]
+    if name == "vit_b_16":
+        return model.encoder.ln
+    if name == "swin_t":
+        return model.norm
+    raise ValueError(
+        f"CAM is not safely implemented for {model_name!r}; supported models are "
+        "resnet50, vgg16, densenet121, inception_v3, efficientnet_b0, "
+        "mobilenet_v3_large, convnext_tiny, vit_b_16 and swin_t"
+    )
 
 
 class CAMGenerator:
-    def __init__(self, model_name='resnet50', device='cuda'):
-        self.device = device
-        self.model, self.target_layer = self._load_model_and_target_layer(model_name)
-        self.model.eval().to(self.device)
+    def __init__(self, model_name="resnet50", device="cuda", model=None,
+                 input_normalized=False, input_size=None):
+        self.device = torch.device(device)
+        self.model_name = model_name.lower()
+        if model is None:
+            from models.model_registry import build_model
+            model = build_model(self.model_name, weights="DEFAULT", device=self.device)
+        self.model = model.to(self.device).eval()
+        self.target_layer = resolve_target_layer(self.model, self.model_name)
+        # ImageNetClassifier normalises inside forward; do not normalise twice.
+        self.input_normalized = bool(input_normalized or isinstance(model, ImageNetClassifier))
+        self.input_size = input_size or (299 if self.model_name == "inception_v3" else 224)
         self.activations = None
         self.gradients = None
         self._register_hooks()
 
-    def _load_model_and_target_layer(self, model_name):
-        model_name = model_name.lower()
-        if model_name == 'resnet50':
-            model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-            target_layer = model.layer4[-1]
-        elif model_name == 'resnet18':
-            model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
-            target_layer = model.layer4[-1]
-        elif model_name == 'densenet121':
-            model = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
-            target_layer = model.features[-1]
-        elif model_name == 'vgg16':
-            model = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
-            target_layer = model.features[-1]
-        else:
-            raise ValueError(f"暂不支持模型: {model_name}")
-        return model, target_layer
-
     def _register_hooks(self):
-        def forward_hook(module, input, output):
+        def forward_hook(_module, _inputs, output):
+            if not isinstance(output, torch.Tensor):
+                raise TypeError(f"CAM target layer must return a tensor, got {type(output).__name__}")
             self.activations = output.detach()
 
-        def backward_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0].detach()
+        def backward_hook(_module, _grad_input, grad_output):
+            if not grad_output or not isinstance(grad_output[0], torch.Tensor):
+                raise TypeError("CAM target layer did not produce a tensor gradient")
+            self.gradients = grad_output[0].detach()
 
         self.target_layer.register_forward_hook(forward_hook)
-        self.target_layer.register_backward_hook(backward_hook)
+        self.target_layer.register_full_backward_hook(backward_hook)
+
+    def _normalize(self, tensor):
+        mean = torch.tensor(IMAGENET_MEAN, dtype=tensor.dtype, device=tensor.device).view(1, 3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, dtype=tensor.dtype, device=tensor.device).view(1, 3, 1, 1)
+        return (tensor - mean) / std
 
     def _preprocess(self, input_data):
-        """
-        支持三种输入类型：PIL.Image / numpy.ndarray / torch.Tensor
-        输出 shape: [1, 3, 224, 224]
-        """
         if isinstance(input_data, torch.Tensor):
-            if input_data.dim() == 3:
-                input_data = input_data.unsqueeze(0)  # [1,3,H,W]
-            if input_data.shape[2:] != (224, 224):
-                input_data = F.interpolate(input_data, size=(224, 224), mode='bilinear', align_corners=False)
-            input_data = self._normalize(input_data).to(self.device)
+            tensor = input_data
+            if tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            if tensor.ndim != 4 or tensor.shape[1] != 3:
+                raise ValueError("CAM tensor input must have shape [B,3,H,W]")
+            tensor = tensor.to(self.device).float()
         else:
             if isinstance(input_data, np.ndarray):
                 input_data = Image.fromarray(input_data.astype(np.uint8))
-            transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
-            ])
-            input_data = transform(input_data).unsqueeze(0).to(self.device)
-        return input_data
+            if not isinstance(input_data, Image.Image):
+                raise TypeError("CAM input must be a PIL image, numpy array or torch tensor")
+            from torchvision.transforms.functional import to_tensor
+            tensor = to_tensor(input_data.convert("RGB")).unsqueeze(0).to(self.device)
+        if tensor.shape[-2:] != (self.input_size, self.input_size):
+            tensor = F.interpolate(tensor, size=(self.input_size, self.input_size),
+                                   mode="bilinear", align_corners=False)
+        # Exactly one normalisation point for tensor, numpy and PIL inputs.
+        return tensor if self.input_normalized else self._normalize(tensor)
 
-    def _normalize(self, tensor):
-        """对已经是 tensor 的图像做标准化"""
-        mean = torch.tensor([0.485, 0.456, 0.406], device=tensor.device).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225], device=tensor.device).view(1, 3, 1, 1)
-        return (tensor - mean) / std
+    @staticmethod
+    def _to_spatial(features, model_name):
+        if features.ndim == 4:
+            if model_name == "swin_t":
+                return features.permute(0, 3, 1, 2)
+            return features
+        if features.ndim == 3 and model_name == "swin_t":
+            return features.permute(2, 0, 1)
+        if features.ndim == 3 and model_name != "vit_b_16":
+            return features  # unbatched NCHW
+        if model_name == "vit_b_16" and features.ndim in (2, 3):
+            batched = features.ndim == 3
+            token_tensor = features if batched else features.unsqueeze(0)
+            tokens = token_tensor[:, 1:, :]
+            grid = math.isqrt(tokens.shape[1])
+            if grid * grid != tokens.shape[1]:
+                raise ValueError(
+                    f"ViT CAM requires one class token and a square token grid; got {token_tensor.shape[1]} tokens"
+                )
+            spatial = tokens.transpose(1, 2).reshape(token_tensor.shape[0], token_tensor.shape[2], grid, grid)
+            return spatial if batched else spatial[0]
+        raise ValueError(f"Cannot safely reshape {model_name} activations with shape {tuple(features.shape)}")
+
+    @staticmethod
+    def _target_tensor(target_classes, output, batch_size, device):
+        if target_classes is None:
+            return output.argmax(dim=1)
+        if isinstance(target_classes, int):
+            return torch.full((batch_size,), target_classes, dtype=torch.long, device=device)
+        targets = torch.as_tensor(target_classes, dtype=torch.long, device=device).reshape(-1)
+        if targets.numel() == 1 and batch_size > 1:
+            targets = targets.expand(batch_size)
+        if targets.numel() != batch_size:
+            raise ValueError(f"Expected {batch_size} CAM target classes, got {targets.numel()}")
+        return targets
+
+    def generate_cam_batch(self, input_tensor_batch, target_classes=None):
+        input_tensor = self._preprocess(input_tensor_batch).detach().requires_grad_(True)
+        output = self.model(input_tensor)
+        if hasattr(output, "logits"):
+            output = output.logits
+        if not isinstance(output, torch.Tensor) or output.ndim != 2:
+            raise ValueError("Classifier must return a [B,num_classes] logits tensor for CAM")
+        targets = self._target_tensor(target_classes, output, input_tensor.shape[0], self.device)
+        cams = []
+        for index in range(input_tensor.shape[0]):
+            self.gradients = None
+            torch.autograd.grad(output[index, targets[index]], input_tensor, retain_graph=True)
+            if self.activations is None or self.gradients is None:
+                raise RuntimeError("CAM hooks did not capture activations and gradients")
+            activations = self._to_spatial(self.activations[index], self.model_name)
+            gradients = self._to_spatial(self.gradients[index], self.model_name)
+            if activations.shape != gradients.shape:
+                raise RuntimeError("CAM activation and gradient shapes differ")
+            weights = gradients.mean(dim=(1, 2), keepdim=True)
+            cam = F.relu((activations * weights).sum(dim=0))
+            cam = cam - cam.min()
+            cam = cam / cam.max().clamp_min(1e-12)
+            cams.append(cam.detach())
+        self.model.zero_grad(set_to_none=True)
+        return torch.stack(cams)
 
     def generate_cam(self, input_data, target_class=None):
-        input_tensor = self._preprocess(input_data)
-        input_tensor.requires_grad = True
+        return self.generate_cam_batch(input_data, target_class)[0].cpu().numpy()
 
-        output = self.model(input_tensor)
-        if target_class is None:
-            target_class = output.argmax().item()
-
-        self.model.zero_grad()
-        class_score = output[0, target_class]
-        class_score.backward()
-
-        pooled_grad = torch.mean(self.gradients, dim=(2, 3), keepdim=True)
-        weighted_activations = self.activations * pooled_grad
-        cam = torch.sum(weighted_activations, dim=1).squeeze().cpu().numpy()
-
-        cam = np.maximum(cam, 0)
-        cam = cam - np.min(cam)
-        cam = cam / (np.max(cam) + 1e-6)
-        return cam
+    def cam_to_mask_batch(self, cams: torch.Tensor, percentile: float = 90):
+        if not 0 <= percentile <= 100:
+            raise ValueError("percentile must be in [0,100]")
+        if cams.ndim == 4 and cams.shape[1] == 1:
+            cams = cams[:, 0]
+        if cams.ndim != 3:
+            raise ValueError("cams must have shape [B,H,W]")
+        thresholds = torch.quantile(cams.float().flatten(1), percentile / 100.0, dim=1)
+        return list((cams >= thresholds[:, None, None]).to(torch.uint8))
 
     def overlay_cam_on_image(self, image, cam, alpha=0.5, colormap=cv2.COLORMAP_JET):
         if isinstance(image, torch.Tensor):
-            image = image.squeeze().permute(1, 2, 0).cpu().numpy()
+            image = image.squeeze().permute(1, 2, 0).detach().cpu().numpy()
             image = np.clip(image * 255, 0, 255).astype(np.uint8)
-
         heatmap = cv2.applyColorMap(np.uint8(255 * cam), colormap)
         heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-        overlay = np.uint8(alpha * heatmap + (1 - alpha) * image)
-        return overlay
+        return np.uint8(alpha * heatmap + (1 - alpha) * image)
 
-    def generate_cam_batch(self, input_tensor_batch, target_classes=None):
-        """
-        批量生成 Grad-CAM，支持目标攻击
-
-        参数：
-            input_tensor_batch: torch.Tensor, shape=[B,3,H,W]
-            target_classes: None / int / list[int] / torch.Tensor, 指定每张图的目标类
-
-        返回：
-            cam_tensor: torch.Tensor, shape = [B, H, W]，归一化至 [0,1]
-        """
-        self.model.eval()
-        B = input_tensor_batch.shape[0]
-        input_tensor_batch = self._normalize(input_tensor_batch).to(self.device)
-        input_tensor_batch.requires_grad_()
-
-        # 前向传播，保存 activations 和 logits
-        output = self.model(input_tensor_batch)  # (B, num_classes)
-
-        # 获取目标类别
-        if target_classes is None:
-            target_classes = output.argmax(dim=1)  # 取预测类
-        elif isinstance(target_classes, int):
-            target_classes = torch.full((B,), target_classes, dtype=torch.long, device=self.device)
-        elif isinstance(target_classes, (list, tuple)):
-            target_classes = torch.tensor(target_classes, dtype=torch.long, device=self.device)
-        elif isinstance(target_classes, torch.Tensor):
-            target_classes = target_classes.to(self.device)
-        else:
-            raise ValueError("target_classes 必须是 None, int, list[int], 或 torch.Tensor")
-
-        cam_list = []
-
-        for i in range(B):
-            self.model.zero_grad()
-            score = output[i, target_classes[i]]
-            score.backward(retain_graph=True)
-
-            activations = self.activations[i]   # shape: (C, H, W)
-            gradients = self.gradients[i]       # shape: (C, H, W)
-            pooled_grad = torch.mean(gradients, dim=(1, 2), keepdim=True)  # (C,1,1)
-            weighted_activations = activations * pooled_grad               # (C,H,W)
-            cam = torch.sum(weighted_activations, dim=0)                   # (H,W)
-            cam = F.relu(cam)  # 去掉负值
-
-            # 归一化至 [0,1]
-            cam = cam - cam.min()
-            cam = cam / (cam.max() + 1e-6)
-
-            cam_list.append(cam.detach())
-
-            # 清除梯度
-            input_tensor_batch.grad = None
-            self.model.zero_grad()
-
-        # 合并为 (B, H, W)
-        cam_tensor = torch.stack(cam_list, dim=0)
-        return cam_tensor
-
-    def cam_to_mask_batch(self, cams: torch.Tensor, percentile: float = 90): 
-        """
-        批量将 CAM 转换为二值掩码 (0/1)，支持 GPU 运算
-
-        参数：
-            cams: torch.Tensor，形状为 [B, H, W]，值范围应为 [0,1]
-            percentile: float，CAM 阈值的百分位 (0-100)，用于生成 mask
-
-        返回：
-            List[torch.Tensor]，每个元素形状为 [H, W]，类型为 uint8（0 或 1）
-        """
-        B, H, W = cams.shape
-        flat = cams.view(B, -1)
-        k = int((100 - percentile) / 100.0 * H * W)
-        thresholds = torch.kthvalue(flat, k + 1, dim=1).values  # kthvalue is 1-indexed
-
-        # [B,1,1] 形状用于广播比较
-        thresholds = thresholds.view(B, 1, 1)
-        masks = (cams >= thresholds).to(torch.uint8)
-
-        return list(masks)  # 每个 [H, W] 的二值 mask
-
-
-    def save_cam_composite_4in1_batch(self,images_tensor: torch.Tensor,
-                                  cams: torch.Tensor,
-                                  masks_batch: list,
-                                  save_dir: str,
-                                  timestamp_str: str = "default_time",
-                                  show: bool = False):
-        """
-        显示并保存四图合成图：原图、CAM图、CAM定位叠加图、Mask图。
-
-        参数:
-            images_tensor: [B, C, H, W]
-            cams: [B, H, W]，值归一化 [0,1]
-            masks_batch: List[torch.Tensor]，每个元素 [H, W]，值为 0/1
-        """
-        B = images_tensor.shape[0]
+    def save_cam_composite_4in1_batch(self, images_tensor, cams, masks_batch, save_dir,
+                                      timestamp_str="default_time", show=False):
         os.makedirs(save_dir, exist_ok=True)
-
-        images_tensor = images_tensor.detach().cpu()
-        cams = cams.detach().cpu()
-
-        for i in range(B):
-            # 原图
-            img = images_tensor[i]
-            if img.max() <= 1.0:
-                img = img * 255.0
-            img = img.to(torch.uint8)
-            img_pil = to_pil_image(img)
-            w, h = img_pil.size
-
-            # CAM 热力图（独立）
-            cam = cams[i].numpy()
-            cam_norm = (cam - cam.min()) / (cam.max() + 1e-6)
-            cmap = plt.get_cmap('jet')
-            cam_color = cmap(cam_norm)[:, :, :3] * 255
-            cam_color = cam_color.astype(np.uint8)
-            cam_pil = Image.fromarray(cam_color).resize((w, h), Image.BILINEAR)
-
-            # CAM 定位图（叠加原图）
-            overlay = Image.blend(img_pil.convert("RGBA"), cam_pil.convert("RGBA"), alpha=0.5)
-
-            # Mask图（红色高亮）
-            mask_np = masks_batch[i].cpu().numpy()
-            mask_rgb = np.stack([mask_np * 255, np.zeros_like(mask_np), np.zeros_like(mask_np)], axis=2).astype(np.uint8)
-            mask_pil = Image.fromarray(mask_rgb).resize((w, h), Image.NEAREST)
-
-            # 绘图 2x2
-            fig, axs = plt.subplots(2, 2, figsize=(8, 8))
-            axs[0, 0].imshow(img_pil)
-            axs[0, 0].set_title("原始图像")
-            axs[0, 1].imshow(cam_pil)
-            axs[0, 1].set_title("CAM 热力图")
-            axs[1, 0].imshow(overlay)
-            axs[1, 0].set_title("CAM 定位图")
-            axs[1, 1].imshow(mask_pil)
-            axs[1, 1].set_title("Mask 区域")
-
-            for ax in axs.flatten():
-                ax.axis("off")
-
+        for index in range(images_tensor.shape[0]):
+            image = to_pil_image(images_tensor[index].detach().cpu())
+            cam = cams[index].detach().cpu().numpy()
+            cam_image = Image.fromarray((cam * 255).astype(np.uint8)).resize(image.size).convert("RGB")
+            mask = masks_batch[index].detach().cpu().numpy().astype(np.uint8)
+            mask_image = Image.fromarray(mask * 255).resize(image.size).convert("RGB")
+            overlay = Image.blend(image.convert("RGB"), cam_image, 0.5)
+            fig, axes = plt.subplots(2, 2, figsize=(8, 8))
+            for axis, content, title in zip(axes.flat, (image, cam_image, overlay, mask_image),
+                                            ("Image", "CAM", "Overlay", "Mask")):
+                axis.imshow(content, cmap="gray")
+                axis.set_title(title)
+                axis.axis("off")
             fig.tight_layout()
-            filename = f"4in1_cam_mask_{timestamp_str}_{i}.png"
-            fig.savefig(os.path.join(save_dir, filename), dpi=300)
+            fig.savefig(os.path.join(save_dir, f"4in1_cam_mask_{timestamp_str}_{index}.png"), dpi=300)
+            if show:
+                plt.show()
             plt.close(fig)
 
-            if show:
-                plt.figure(figsize=(8, 8))
-                plt.imshow(np.asarray(fig.canvas.buffer_rgba()))
-                plt.axis("off")
-                plt.title(f"Sample {i}")
-                plt.show()
-
-
-
-    
 
 def cam_to_mask(cam: np.ndarray, percentile: float = 90) -> np.ndarray:
-    """
-    将 CAM 映射为二值掩码，高于 percentile 的区域标记为 1。
-    cam: [H,W]，归一化后的热力图
-    """
-    threshold = np.percentile(cam, percentile)
-    binary_mask = (cam >= threshold).astype(np.uint8)
-    return binary_mask
-
-    
+    if not 0 <= percentile <= 100:
+        raise ValueError("percentile must be in [0,100]")
+    return (cam >= np.percentile(cam, percentile)).astype(np.uint8)

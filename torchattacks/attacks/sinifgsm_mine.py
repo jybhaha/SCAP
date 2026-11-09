@@ -84,7 +84,7 @@ class SINIFGSM_MINE(Attack):
                 torch.abs(adv_grad), dim=(1, 2, 3), keepdim=True
             )
             momentum = grad
-            
+
             scaling_factor = torch.where(attr > self.threshold, self.gradient_scale_up, self.gradient_scale_down)  # 高于门限放大，否则缩小
             adjusted_grad = grad.sign() * scaling_factor
 
